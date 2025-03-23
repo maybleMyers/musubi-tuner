@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
+import cv2
 
 from networks import lora_wan
 from utils.safetensors_utils import mem_eff_save_file, load_safetensors
@@ -66,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--exclude_single_blocks", action="store_true", help="Exclude single blocks when loading LoRA weights")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
     parser.add_argument(
@@ -96,6 +98,7 @@ def parse_args() -> argparse.Namespace:
         help="Guidance scale for classifier free guidance. Default is 5.0.",
     )
     parser.add_argument("--video_path", type=str, default=None, help="path to video for video2video inference")
+    parser.add_argument("--strength", type=float, default=0.75, help="Strength for video2video inference (0.0-1.0)")
     parser.add_argument("--image_path", type=str, default=None, help="path to image for image2video inference")
     parser.add_argument("--end_image_path", type=str, default=None, help="path to end image for image2video inference")
     parser.add_argument("--trim_tail_frames", type=int, default=0, help="trim tail N frames from the video before saving")
@@ -785,6 +788,9 @@ def setup_scheduler(args: argparse.Namespace, config, device: torch.device) -> T
     return scheduler, timesteps
 
 
+# Modify the run_sampling function in wan_generate_video.py
+# Replace the entire function with this implementation that properly handles tensor dimensions
+
 def run_sampling(
     model: WanModel,
     noise: torch.Tensor,
@@ -820,11 +826,17 @@ def run_sampling(
     latent_storage_device = device if not use_cpu_offload else "cpu"
     latent = latent.to(latent_storage_device)
 
+    # Get SLG parameters if available
+    slg_list = getattr(args, 'slg_layers', None)
+    slg_start = getattr(args, 'slg_start', 0.0)
+    slg_end = getattr(args, 'slg_end', 0.3)
+    total_steps = len(timesteps)
+
     # cfg skip
     apply_cfg_array = []
     num_timesteps = len(timesteps)
 
-    if args.cfg_skip_mode != "none" and args.cfg_apply_ratio is not None:
+    if hasattr(args, 'cfg_skip_mode') and args.cfg_skip_mode != "none" and hasattr(args, 'cfg_apply_ratio') and args.cfg_apply_ratio is not None:
         # Calculate thresholds based on cfg_apply_ratio
         apply_steps = int(num_timesteps * args.cfg_apply_ratio)
 
@@ -870,61 +882,72 @@ def run_sampling(
         # Apply CFG on all steps
         apply_cfg_array = [True] * num_timesteps
 
-    # SLG original implementation is based on https://github.com/Stability-AI/sd3.5/blob/main/sd3_impls.py
-    slg_start_step = int(args.slg_start * num_timesteps)
-    slg_end_step = int(args.slg_end * num_timesteps)
-
     for i, t in enumerate(tqdm(timesteps)):
-        # latent is on CPU if use_cpu_offload is True
-        latent_model_input = [latent.to(device)]
+        # Determine if SLG should be applied for this step
+        slg_layers_local = None
+        if slg_list is not None:
+            if int(slg_start * total_steps) <= i < int(slg_end * total_steps):
+                slg_layers_local = slg_list
+
+        # Process latent tensor to ensure correct dimensionality
+        # Check if latent needs batch dimension adjustment
+        if len(latent.shape) == 5 and latent.shape[0] == 1:  # [1, C, F, H, W]
+            # Remove batch dimension to get [C, F, H, W]
+            latent_for_model = latent.squeeze(0)
+        else:
+            latent_for_model = latent
+            
+        # Move to device
+        latent_for_model = latent_for_model.to(device)
+        
+        # Provide as a list with a single tensor
+        latent_model_input = [latent_for_model]
         timestep = torch.stack([t]).to(device)
 
         with accelerator.autocast(), torch.no_grad():
-            noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0].to(latent_storage_device)
+            # Get conditional prediction
+            noise_pred_cond = model(
+                latent_model_input, 
+                t=timestep, 
+                **arg_c
+            )[0]
+            
+            if use_cpu_offload:
+                noise_pred_cond = noise_pred_cond.to(latent_storage_device)
 
             apply_cfg = apply_cfg_array[i]  # apply CFG or not
+            
             if apply_cfg:
-                apply_slg = i >= slg_start_step and i < slg_end_step
-                # print(f"Applying SLG: {apply_slg}, i: {i}, slg_start_step: {slg_start_step}, slg_end_step: {slg_end_step}")
-                if args.slg_mode == "original" and apply_slg:
-                    noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0].to(latent_storage_device)
-
-                    # apply guidance
-                    # SD3 formula: scaled = neg_out + (pos_out - neg_out) * cond_scale
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-
-                    # calculate skip layer out
-                    skip_layer_out = model(latent_model_input, t=timestep, skip_block_indices=args.slg_layers, **arg_null)[0].to(
-                        latent_storage_device
-                    )
-
-                    # apply skip layer guidance
-                    # SD3 formula: scaled = scaled + (pos_out - skip_layer_out) * self.slg
-                    noise_pred = noise_pred + args.slg_scale * (noise_pred_cond - skip_layer_out)
-                elif args.slg_mode == "uncond" and apply_slg:
-                    # noise_pred_uncond is skip layer out
-                    noise_pred_uncond = model(latent_model_input, t=timestep, skip_block_indices=args.slg_layers, **arg_null)[0].to(
-                        latent_storage_device
-                    )
-
-                    # apply guidance
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-
-                else:
-                    # normal guidance
-                    noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0].to(latent_storage_device)
-
-                    # apply guidance
-                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                # Get unconditional prediction
+                noise_pred_uncond = model(
+                    latent_model_input, 
+                    t=timestep, 
+                    skip_block_indices=slg_layers_local,
+                    **arg_null
+                )[0]
+                
+                if use_cpu_offload:
+                    noise_pred_uncond = noise_pred_uncond.to(latent_storage_device)
+                
+                # Apply guidance
+                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 noise_pred = noise_pred_cond
 
-            # step
-            latent_input = latent.unsqueeze(0)
+            # Check if we need to add a batch dimension for the scheduler
+            if len(latent.shape) == 4:  # [C, F, H, W]
+                latent_input = latent.unsqueeze(0)  # [1, C, F, H, W]
+            else:
+                latent_input = latent
+                
+            # Step
             temp_x0 = scheduler.step(noise_pred.unsqueeze(0), t, latent_input, return_dict=False, generator=seed_g)[0]
 
-            # update latent
-            latent = temp_x0.squeeze(0)
+            # Update latent - preserve shape
+            if len(latent.shape) == 4:  # [C, F, H, W]
+                latent = temp_x0.squeeze(0)
+            else:
+                latent = temp_x0
 
     return latent
 
@@ -967,17 +990,69 @@ def generate(args: argparse.Namespace) -> torch.Tensor:
     mixed_precision = "bf16" if dit_dtype == torch.bfloat16 else "fp16"
     accelerator = accelerate.Accelerator(mixed_precision=mixed_precision)
 
-    # I2V or T2V
+    # I2V or T2V or V2V
     is_i2v = "i2v" in args.task
+    is_v2v = args.video_path is not None
 
     # prepare seed
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
     args.seed = seed  # set seed to args for saving
 
-    # prepare inputs
-    if is_i2v:
-        # I2V: need text encoder, VAE and CLIP
+    # Load VAE early if we need it for video or image processing
+    vae = None
+    if is_v2v or is_i2v or args.image_path is not None:
+        # Load VAE for encoding
         vae = load_vae(args, cfg, device, vae_dtype)
+    
+    # Process video for V2V if provided
+    video_latents = None
+    if is_v2v:
+        logger.info(f"Video2Video inference: {args.video_path}")
+        
+        # For V2V, don't automatically extend - use the specified video_length if provided
+        # Otherwise, use the natural length of the video
+        if args.video_length is None:
+            logger.info("No video_length specified, will use the natural length of the video")
+            # Just load the video without trying to extend it
+            video = load_video(args.video_path, 0, None, bucket_reso=tuple(args.video_size))
+            video = np.stack(video, axis=0)  # [F, H, W, C]
+            video = torch.from_numpy(video).permute(3, 0, 1, 2).unsqueeze(0).float()  # [1, C, F, H, W]
+            video = video / 255.0
+            
+            # Update args.video_length with the actual length
+            args.video_length = video.shape[2]
+            logger.info(f"Set video_length to match input video: {args.video_length} frames")
+        else:
+            # User specified a video_length, so use it
+            logger.info(f"Using specified video_length: {args.video_length} frames")
+            
+            # Load the first args.video_length frames of the video
+            video = load_video(args.video_path, 0, args.video_length, bucket_reso=tuple(args.video_size))
+            video = np.stack(video, axis=0)  # [F, H, W, C]
+            video = torch.from_numpy(video).permute(3, 0, 1, 2).unsqueeze(0).float()  # [1, C, F, H, W]
+            video = video / 255.0
+            
+            # Double-check that we got the right number of frames
+            if video.shape[2] < args.video_length:
+                logger.warning(f"Could only load {video.shape[2]} frames, less than requested {args.video_length}")
+                args.video_length = video.shape[2]
+
+        # Log the video shape before encoding
+        logger.info(f"Video tensor shape before encoding: {video.shape}")
+
+        # Encode video to latents
+        logger.info(f"Encoding video to latents")
+        video_latents = encode_video_to_latents(video, vae, device, dit_dtype)
+
+        # Free memory
+        del video
+        clean_memory_on_device(device)
+
+        # Prepare inputs for V2V 
+        noise, context, context_null, inputs, seed_g = prepare_v2v_inputs(args, cfg, accelerator, device, vae, video_latents)
+    elif is_i2v:
+        # I2V: need text encoder, VAE and CLIP
+        # vae was already loaded above
         noise, context, context_null, y, inputs = prepare_i2v_inputs(args, cfg, accelerator, device, vae)
         # vae is on CPU
     else:
@@ -1006,8 +1081,30 @@ def generate(args: argparse.Namespace) -> torch.Tensor:
     seed_g = torch.Generator(device=device)
     seed_g.manual_seed(seed)
 
+    # Adjust timesteps for V2V if needed
+    if is_v2v and args.strength < 1.0:
+        # Calculate number of inference steps based on strength
+        num_inference_steps = max(1, int(args.infer_steps * args.strength))
+        logger.info(f"Strength: {args.strength}, adjusted inference steps: {num_inference_steps}")
+        
+        # Get starting timestep based on strength
+        t_start_idx = len(timesteps) - num_inference_steps
+        t_start = timesteps[t_start_idx]
+        
+        # Mix noise and video latents based on starting timestep
+        t_value = t_start / 1000.0  # Normalize to 0-1 range
+        logger.info(f"Mixing noise and video latents with t_value: {t_value}")
+        noise = noise * t_value + video_latents * (1.0 - t_value)
+        
+        # Use only the required timesteps
+        timesteps = timesteps[-num_inference_steps:]
+        
+        latent = noise  # Initialize latent with the noise+video mixture
+    else:
+        latent = noise  # Use regular noise for standard generation
+
     # run sampling
-    latent = run_sampling(model, noise, scheduler, timesteps, args, inputs, device, seed_g, accelerator, is_i2v)
+    latent = run_sampling(model, latent, scheduler, timesteps, args, inputs, device, seed_g, accelerator, is_i2v)
 
     # free memory
     del model
@@ -1054,7 +1151,14 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
 
     logger.info(f"Decoding video from latents: {latent.shape}")
     x0 = latent.to(device)
-
+    
+    # Ensure correct dimensionality - VAE decoder expects [C, F, H, W] or [B, C, F, H, W]
+    # Reshape if needed
+    if len(x0.shape) > 5:  # Too many dimensions
+        x0 = x0.squeeze(0)  # Remove extra batch dimension
+    elif len(x0.shape) < 5:  # Too few dimensions (shouldn't happen)
+        x0 = x0.unsqueeze(0)  # Add batch dimension
+        
     with torch.autocast(device_type=device.type, dtype=vae_dtype), torch.no_grad():
         videos = vae.decode(x0)
 
@@ -1131,6 +1235,296 @@ def save_output(
         save_images_grid(sample, save_path, image_name, rescale=True)
         logger.info(f"Sample images save to: {save_path}/{image_name}")
 
+def prepare_v2v_inputs(args, cfg, accelerator, device, vae, video_latents):
+    """Prepare inputs for Video2Video inference
+    
+    Args:
+        args (argparse.Namespace): Command line arguments
+        cfg: Model configuration
+        accelerator: Accelerator instance
+        device (torch.device): Device to use
+        vae: VAE model
+        video_latents (torch.Tensor): Encoded latent representation of input video
+        
+    Returns:
+        Tuple containing noise, context, context_null, (arg_c, arg_null), and seed_g
+    """
+    # Get dimensions directly from the latent
+    if len(video_latents.shape) == 5:  # [B, C, F, H, W]
+        batch_size, channels, lat_f, lat_h, lat_w = video_latents.shape
+    else:  # [C, F, H, W]
+        channels, lat_f, lat_h, lat_w = video_latents.shape
+        batch_size = 1
+    
+    # Calculate spatial tokens per frame using the model's patch size
+    patch_h, patch_w = cfg.patch_size[1], cfg.patch_size[2]
+    spatial_tokens = (lat_h * lat_w) // (patch_h * patch_w)
+    
+    # Calculate the sequence length based on actual latent dimensions
+    seq_len = spatial_tokens * lat_f
+    
+    # Log detailed information about latent dimensions and sequence length
+    logger.info(f"Video latent dimensions: channels={channels}, frames={lat_f}, height={lat_h}, width={lat_w}")
+    logger.info(f"Using patch size: {patch_h}x{patch_w}, spatial tokens per frame: {spatial_tokens}")
+    logger.info(f"Calculated sequence length: {seq_len}")
+    
+    # Configure negative prompt
+    n_prompt = args.negative_prompt if args.negative_prompt else cfg.sample_neg_prompt
+    
+    # Set seed
+    seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+    args.seed = seed  # Update args for consistency
+    
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(seed)
+    
+    # Load text encoder
+    text_encoder = load_text_encoder(args, cfg, device)
+    text_encoder.model.to(device)
+    
+    # Encode prompt
+    with torch.no_grad():
+        if args.fp8_t5:
+            with torch.amp.autocast(device_type=device.type, dtype=cfg.t5_dtype):
+                context = text_encoder([args.prompt], device)
+                context_null = text_encoder([n_prompt], device)
+        else:
+            context = text_encoder([args.prompt], device)
+            context_null = text_encoder([n_prompt], device)
+    
+    # Free text encoder and clean memory
+    del text_encoder
+    clean_memory_on_device(device)
+    
+    # Generate noise with the same shape as video_latents
+    noise = torch.randn(
+        video_latents.shape,
+        dtype=torch.float32, 
+        device=device, 
+        generator=seed_g
+    )
+    
+    # Prepare model input arguments
+    arg_c = {"context": context, "seq_len": seq_len}
+    arg_null = {"context": context_null, "seq_len": seq_len}
+    
+    return noise, context, context_null, (arg_c, arg_null), seed_g
+
+def load_video(video_path, start_frame=0, num_frames=None, bucket_reso=(256, 256)):
+    """Load video frames and resize them to the target resolution.
+    
+    Args:
+        video_path (str): Path to the video file
+        start_frame (int): First frame to load (0-indexed)
+        num_frames (int, optional): Number of frames to load. If None, load all frames.
+        bucket_reso (tuple): Target resolution (height, width)
+        
+    Returns:
+        list: List of numpy arrays containing video frames in RGB format
+    """
+    logger.info(f"Loading video from {video_path}, frames {start_frame}-{start_frame+num_frames if num_frames else 'end'}")
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Failed to open video file: {video_path}")
+    
+    # Get total frame count and FPS
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    logger.info(f"Video has {total_frames} frames, {fps} FPS")
+    
+    # Calculate how many frames to load
+    if num_frames is None:
+        num_frames = total_frames - start_frame
+    else:
+        # Make sure we don't try to load more frames than exist
+        num_frames = min(num_frames, total_frames - start_frame)
+    
+    # Skip to start frame
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    
+    # Read frames
+    frames = []
+    for _ in range(num_frames):
+        ret, frame = cap.read()
+        if not ret:
+            logger.warning(f"Reached end of video after {len(frames)} frames")
+            break
+        
+        # Convert from BGR to RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Resize the frame
+        h, w = bucket_reso
+        frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+        
+        frames.append(frame)
+    
+    cap.release()
+    logger.info(f"Successfully loaded {len(frames)} frames")
+    
+    return frames
+
+def glob_images(image_dir):
+    """Get list of image files in directory."""
+    extensions = ['jpg', 'jpeg', 'png', 'webp', 'bmp']
+    image_files = []
+    
+    for ext in extensions:
+        image_files.extend(list(Path(image_dir).glob(f"*.{ext}")))
+        image_files.extend(list(Path(image_dir).glob(f"*.{ext.upper()}")))
+    
+    return image_files
+
+def extend_video_frames(video: torch.Tensor, target_frames: int) -> torch.Tensor:
+    """Extend video to target number of frames by repeating frames."""
+    current_frames = video.shape[2]
+    if current_frames >= target_frames:
+        return video
+    
+    # Create repeat pattern with evenly distributed repeats
+    base_repeats = target_frames // current_frames
+    extra = target_frames % current_frames
+    
+    repeats = torch.full((current_frames,), base_repeats, 
+                         dtype=torch.int64, device=video.device)
+    repeats[:extra] += 1  # Distribute extra repeats to early frames
+    
+    # Create index pattern
+    indices = torch.arange(current_frames, device=video.device)
+    indices = indices.repeat_interleave(repeats)
+    
+    extended_video = torch.index_select(video, 2, indices)
+    return extended_video
+
+def load_and_extend_video(video_path, video_length, bucket_reso=(256, 256), extend=True):
+    """Load video and extend it to match target length if needed and requested.
+    
+    Args:
+        video_path: Path to input video file or directory of images
+        video_length: Target video length
+        bucket_reso: Resolution to resize to (height, width)
+        extend: Whether to extend the video to match video_length
+               False means keep original length, True means extend if needed
+    
+    Returns:
+        torch.Tensor: Video tensor with shape [1, C, F, H, W]
+    """
+    # Load video or image sequence
+    if os.path.isfile(video_path):
+        # Load video file
+        video = load_video(video_path, 0, None, bucket_reso=bucket_reso)  # Pass None to load all frames
+    else:
+        # Load images
+        image_files = glob_images(video_path)
+        if len(image_files) == 0:
+            raise ValueError(f"No image files found in {video_path}")
+        
+        image_files.sort()
+        video = []
+        for image_file in image_files:  # Don't limit to video_length yet
+            image = Image.open(image_file)
+            image = resize_image_to_bucket(image, bucket_reso)
+            video.append(image)
+    
+    # Get the actual frame count
+    actual_frame_count = len(video)
+    logger.info(f"Loaded video with {actual_frame_count} frames")
+    
+    # Only extend if requested and needed
+    if extend and actual_frame_count < video_length:
+        logger.info(f"Video length ({actual_frame_count}) is less than target length ({video_length}). Extending video...")
+        # Convert list of frames to tensor
+        video_tensor = torch.from_numpy(np.stack(video, axis=0))  # [F, H, W, C]
+        video_tensor = video_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
+        
+        # Extend the video
+        extended_tensor = extend_video_frames(video_tensor, video_length)
+        
+        # Convert back to list of frames
+        extended_tensor = extended_tensor.squeeze(0).permute(1, 2, 3, 0)  # [F, H, W, C]
+        video = [frame.numpy() for frame in extended_tensor]
+        
+        logger.info(f"Video extended to {len(video)} frames")
+    else:
+        # If we're not extending, ensure we don't have too many frames
+        if not extend and video_length is not None and actual_frame_count > video_length:
+            logger.info(f"Limiting video to first {video_length} frames from {actual_frame_count} total frames")
+            video = video[:video_length]
+    
+    # Stack video frames
+    video = np.stack(video, axis=0)  # [F, H, W, C]
+    video = torch.from_numpy(video).permute(3, 0, 1, 2).unsqueeze(0).float()  # [1, C, F, H, W]
+    video = video / 255.0  # Normalize to [0, 1]
+    
+    logger.info(f"Final video tensor shape: {video.shape}")
+    return video
+
+def encode_video_to_latents(video, vae, device, vae_dtype):
+    """Encode video to latent space using VAE.
+    
+    Args:
+        video (torch.Tensor): Video tensor with shape [B, C, F, H, W]
+        vae (WanVAE): VAE model
+        device (torch.device): Device to use for encoding
+        vae_dtype (torch.dtype): Dtype to use for the latents
+    
+    Returns:
+        torch.Tensor: Encoded latents with shape [B, C', F', H', W']
+    """
+    logger.info(f"Encoding video to latents: {video.shape}")
+    
+    # Move video to device with the right dtype
+    video = video.to(device=device, dtype=torch.float32)
+    
+    # Convert from [0, 1] to [-1, 1] range expected by VAE
+    video = video * 2 - 1
+    
+    # Move VAE to device
+    vae.to_device(device)
+    
+    # Get video dimensions
+    batch_size, channels, num_frames, height, width = video.shape
+    
+    # Calculate expected latent dimensions based on VAE version
+    # This logic mirrors what's in hv_generate_video.py
+    vae_ver = vae.model.vae_ver if hasattr(vae.model, 'vae_ver') else ""
+    
+    if "884" in vae_ver:
+        expected_lat_f = (num_frames - 1) // 4 + 1
+        logger.info(f"Using VAE version with 884 temporal stride, expecting {expected_lat_f} latent frames")
+    elif "888" in vae_ver:
+        expected_lat_f = (num_frames - 1) // 8 + 1
+        logger.info(f"Using VAE version with 888 temporal stride, expecting {expected_lat_f} latent frames")
+    else:
+        expected_lat_f = num_frames
+        logger.info(f"Using VAE version with no temporal stride, expecting {expected_lat_f} latent frames")
+    
+    # The WanVAE.encode method expects input in format [C, T, H, W] (no batch dimension)
+    # We need to extract the video without batch dimension
+    video_no_batch = video[0]  # Shape [C, F, H, W]
+    
+    with torch.no_grad():
+        try:
+            # Encode the video - WanVAE.encode expects a list containing the video tensor
+            latents = vae.encode([video_no_batch])[0]
+            
+            # Log the actual latent shape for debugging
+            logger.info(f"Encoded latent shape: {latents.shape}")
+        except RuntimeError as e:
+            logger.error(f"Error encoding video: {str(e)}")
+            raise  # Re-raise the error after logging
+    
+    # Add batch dimension back
+    latents = latents.unsqueeze(0)  # [1, C, F', H', W']
+    
+    # Convert to the desired dtype
+    latents = latents.to(dtype=vae_dtype)
+    
+    logger.info(f"Final latent shape: {latents.shape}")
+    
+    return latents
 
 def main():
     # 引数解析
@@ -1150,6 +1544,14 @@ def main():
         # setup arguments
         args = setup_args(args)
         height, width, video_length = check_inputs(args)
+
+        # Log generation type
+        if args.video_path is not None:
+            logger.info(f"Running video-to-video inference with strength {args.strength}")
+        elif args.image_path is not None:
+            logger.info(f"Running image-to-video inference")
+        else:
+            logger.info(f"Running text-to-video inference")
 
         logger.info(
             f"video size: {height}x{width}@{video_length} (HxW@F), fps: {args.fps}, "
@@ -1212,6 +1614,7 @@ def main():
         # # use the arguments TODO get from latent shape
         # height, width = args.video_size
         # video_length = args.video_length
+        cfg = WAN_CONFIGS[args.task]
         height = latents.shape[-2]
         width = latents.shape[-1]
         height *= cfg.patch_size[1] * cfg.vae_stride[1]
