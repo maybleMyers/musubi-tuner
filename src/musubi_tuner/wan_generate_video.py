@@ -763,16 +763,22 @@ def load_dit_model(
         if not args.ram_torch:
             model.to(target_device, target_dtype)  # move and cast at the same time. this reduces redundant copy operations
         else:
-            # For RamTorch, only move non-Linear layers to device
-            # Linear layer weights must remain in CPU RAM
+            # For RamTorch, we need to move all non-Linear layers to GPU
+            # but keep Linear layer weights in CPU RAM
+            logger.info("Moving non-Linear layers to GPU while keeping Linear weights in CPU RAM")
+
+            # First, handle dtype conversion if needed
+            if target_dtype is not None:
+                model = model.to(target_dtype)
+
+            # Then move all non-Linear modules to GPU
             for name, module in model.named_modules():
-                if not isinstance(module, (RamTorchLinear.Linear if RamTorchLinear else type(None))):
-                    # Skip the model itself and container modules
-                    if module is not model and not hasattr(module, 'children'):
-                        try:
-                            module.to(device, target_dtype)
-                        except:
-                            pass  # Some modules might not support .to()
+                if isinstance(module, RamTorchLinear.Linear if RamTorchLinear else type(None)):
+                    # Skip RamTorch Linear layers - they manage their own device placement
+                    continue
+                elif hasattr(module, 'weight') or hasattr(module, 'bias'):
+                    # This is a layer with parameters (Conv, BatchNorm, etc) - move to GPU
+                    module.to(device)
 
     if args.compile:
         compile_backend, compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
