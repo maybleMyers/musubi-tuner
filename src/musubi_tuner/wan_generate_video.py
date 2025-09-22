@@ -48,6 +48,14 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# Try to import RamTorch for memory optimization
+try:
+    from musubi_tuner.modules import linear as RamTorchLinear
+    logger.info("Successfully imported RamTorch.")
+except ImportError:
+    RamTorchLinear = None
+    logger.warning("RamTorch not found. Running with standard torch.nn.Linear.")
+
 
 class GenerationSettings:
     def __init__(
@@ -208,6 +216,12 @@ def parse_args() -> argparse.Namespace:
         help="attention mode",
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
+    parser.add_argument(
+        "--ram_torch",
+        action="store_true",
+        default=False,
+        help="Enable RamTorch memory optimization. Keeps model weights in CPU RAM, transfers to GPU on-demand."
+    )
     parser.add_argument(
         "--output_type",
         type=str,
@@ -583,6 +597,52 @@ def load_dit_models(
     return [model]
 
 
+def replace_linear_with_ramtorch(model: torch.nn.Module, device="cuda"):
+    """
+    Recursively replaces torch.nn.Linear with RamTorchLinear.
+    IMPORTANT: Model weights stay in CPU RAM after replacement.
+
+    Args:
+        model: The model to modify
+        device: The target GPU device for computation (weights stay on CPU)
+
+    Returns:
+        The modified model with RamTorch Linear layers
+    """
+    if RamTorchLinear is None:
+        logger.warning("RamTorch is not available. Skipping replacement.")
+        return model
+
+    replaced_count = 0
+    for name, module in model.named_children():
+        if len(list(module.children())) > 0:
+            # Recurse into submodule
+            replace_linear_with_ramtorch(module, device)
+
+        if isinstance(module, torch.nn.Linear):
+            # Replace the linear layer
+            new_module = RamTorchLinear.Linear(
+                in_features=module.in_features,
+                out_features=module.out_features,
+                bias=module.bias is not None,
+                device=device
+            )
+
+            # Copy weights to CPU (RamTorchLinear keeps them there)
+            new_module.weight.data.copy_(module.weight.data.to("cpu"))
+            if module.bias is not None:
+                new_module.bias.data.copy_(module.bias.data.to("cpu"))
+
+            setattr(model, name, new_module)
+            replaced_count += 1
+            logger.debug(f"Replaced {name} with RamTorchLinear (weights in CPU RAM)")
+
+    if replaced_count > 0:
+        logger.info(f"Replaced {replaced_count} Linear layers with RamTorchLinear")
+
+    return model
+
+
 def load_dit_model(
     args: argparse.Namespace,
     dit_path: str,
@@ -612,7 +672,7 @@ def load_dit_model(
     # If LyCORIS is enabled, we will load the model to CPU and then merge LoRA weights (static method)
 
     loading_device = "cpu"
-    if args.blocks_to_swap == 0 and not args.lycoris:
+    if args.blocks_to_swap == 0 and not args.lycoris and not args.ram_torch:
         loading_device = device
 
     # load LoRA weights
@@ -674,6 +734,19 @@ def load_dit_model(
     if args.save_merged_model:
         return None
 
+    # Apply RamTorch optimization if requested
+    if args.ram_torch:
+        if RamTorchLinear is not None:
+            logger.info("Applying RamTorch - model weights will stay in CPU RAM")
+            # Ensure model is on CPU before replacement
+            if not isinstance(loading_device, str) or loading_device != "cpu":
+                model.to("cpu")
+            replace_linear_with_ramtorch(model, device=str(device))
+            logger.info("RamTorch applied - Linear layer weights are in CPU RAM, will transfer on-demand")
+        else:
+            logger.warning("RamTorch module not available. --ram_torch flag ignored.")
+            args.ram_torch = False  # Disable flag to prevent further issues
+
     if not args.fp8_scaled:
         # simple cast to dit_weight_dtype
         target_dtype = None  # load as-is (dit_weight_dtype == dtype of the weights in state_dict)
@@ -683,11 +756,23 @@ def load_dit_model(
             logger.info(f"Convert model to {dit_weight_dtype}")
             target_dtype = dit_weight_dtype
 
-        if args.blocks_to_swap == 0:
+        if args.blocks_to_swap == 0 and not args.ram_torch:
             logger.info(f"Move model to device: {device}")
             target_device = device
 
-        model.to(target_device, target_dtype)  # move and cast  at the same time. this reduces redundant copy operations
+        if not args.ram_torch:
+            model.to(target_device, target_dtype)  # move and cast at the same time. this reduces redundant copy operations
+        else:
+            # For RamTorch, only move non-Linear layers to device
+            # Linear layer weights must remain in CPU RAM
+            for name, module in model.named_modules():
+                if not isinstance(module, (RamTorchLinear.Linear if RamTorchLinear else type(None))):
+                    # Skip the model itself and container modules
+                    if module is not model and not hasattr(module, 'children'):
+                        try:
+                            module.to(device, target_dtype)
+                        except:
+                            pass  # Some modules might not support .to()
 
     if args.compile:
         compile_backend, compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
@@ -705,12 +790,15 @@ def load_dit_model(
             )
 
     if args.blocks_to_swap > 0:
-        logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
-        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
-        model.move_to_device_except_swap_blocks(device)
-        model.prepare_block_swap_before_forward()
-    else:
-        # make sure the model is on the right device
+        if args.ram_torch:
+            logger.warning("Block swap is not compatible with RamTorch. RamTorch handles memory management.")
+        else:
+            logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
+            model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+            model.move_to_device_except_swap_blocks(device)
+            model.prepare_block_swap_before_forward()
+    elif not args.ram_torch:
+        # make sure the model is on the right device (if not using RamTorch)
         model.to(device)
 
     model.eval().requires_grad_(False)
@@ -2196,6 +2284,11 @@ def main():
     assert not (args.offload_inactive_dit and args.lazy_loading), (
         "--offload_inactive_dit and --lazy_loading cannot be used together"
     )
+
+    # Validate RamTorch and block_swap compatibility
+    if args.ram_torch and args.blocks_to_swap > 0:
+        logger.warning("RamTorch and block_swap cannot be used together. Disabling block_swap.")
+        args.blocks_to_swap = 0
 
     # Check if latents are provided
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
