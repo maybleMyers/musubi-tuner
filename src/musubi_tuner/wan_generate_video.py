@@ -83,6 +83,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dit_high_noise", type=str, default=None, help="DiT checkpoint path for high noise (optional)")
     parser.add_argument("--offload_inactive_dit", action="store_true", help="Offload DiT model to CPU")
     parser.add_argument("--lazy_loading", action="store_true", help="Enable lazy loading for DiT models")
+    parser.add_argument(
+        "--dynamic_dit_loading",
+        action="store_true",
+        help="Load models on-demand and completely unload before switching (saves memory, requires --dit and --dit_high_noise)"
+    )
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint path")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is bfloat16")
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
@@ -571,9 +576,12 @@ def load_dit_models(
         List[WanModel]: loaded DiT models. If args.dit_high_noise is specified, returns a list with two models: high noise and low noise.
     """
     use_high_model = args.dit_high_noise is not None and len(args.dit_high_noise) > 0
-    if use_high_model and args.lazy_loading:
-        logger.info("Using lazy loading")
-        return [None, None]  # lazy loading will load models on demand
+    if use_high_model and (args.lazy_loading or args.dynamic_dit_loading):
+        if args.lazy_loading:
+            logger.info("Using lazy loading")
+        else:
+            logger.info("Using dynamic DiT loading - models will be loaded on-demand")
+        return [None, None]  # models will be loaded on demand
 
     model = load_dit_model(args, args.dit, args.lora_weight, args.lora_multiplier, config, device, dit_weight_dtype)
 
@@ -1499,34 +1507,52 @@ def run_sampling(
             guidance_scale = args.guidance_scale
             logger.info(f"Switching to low noise at step {i}, t={t}, guidance_scale={guidance_scale}")
 
-            del model
-            gc.collect()
+            if args.dynamic_dit_loading:
+                # Completely unload high noise model before loading low noise model
+                logger.info("Dynamic DiT loading: Completely unloading high noise model")
+                del model
+                model = None  # Clear reference
 
-            if len(models) > 1 and (args.offload_inactive_dit or args.lazy_loading):
-                if args.blocks_to_swap > 0:
-                    # prepare block swap for low noise model
-                    logger.info("Waiting for 5 seconds to finish block swap")
-                    time.sleep(5)
-
-                if args.offload_inactive_dit:
-                    logger.info("Switching model to CPU/GPU for both low and high noise models")
-                    models[0].to("cpu")
-
-                    if args.blocks_to_swap > 0:
-                        # prepare block swap for low noise model
-                        models[-1].move_to_device_except_swap_blocks(device)
-                        models[-1].prepare_block_swap_before_forward()
-
-                else:  # lazy loading
-                    pass
-
+                # Force cleanup
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 gc.collect()
+
+                # Small delay to ensure cleanup completes
+                time.sleep(0.5)
                 clean_memory_on_device(device)
 
-            model = models[-1]  # use low noise model for low noise steps
+                logger.info("High noise model unloaded, now loading low noise model")
+                # The low noise model will be loaded below in the "if model is None" block
+            else:
+                del model
+                gc.collect()
+
+                if len(models) > 1 and (args.offload_inactive_dit or args.lazy_loading):
+                    if args.blocks_to_swap > 0:
+                        # prepare block swap for low noise model
+                        logger.info("Waiting for 5 seconds to finish block swap")
+                        time.sleep(5)
+
+                    if args.offload_inactive_dit:
+                        logger.info("Switching model to CPU/GPU for both low and high noise models")
+                        models[0].to("cpu")
+
+                        if args.blocks_to_swap > 0:
+                            # prepare block swap for low noise model
+                            models[-1].move_to_device_except_swap_blocks(device)
+                            models[-1].prepare_block_swap_before_forward()
+
+                    else:  # lazy loading
+                        pass
+
+                    gc.collect()
+                    clean_memory_on_device(device)
+
+                model = models[-1]  # use low noise model for low noise steps
 
         if model is None:
-            # lazy loading
+            # lazy loading or dynamic loading
             dit_path = args.dit_high_noise if is_high_noise else args.dit
             lora_weight = args.lora_weight_high_noise if is_high_noise else args.lora_weight
             lora_multiplier = args.lora_multiplier_high_noise if is_high_noise else args.lora_multiplier
@@ -2300,6 +2326,17 @@ def main():
     assert not (args.offload_inactive_dit and args.lazy_loading), (
         "--offload_inactive_dit and --lazy_loading cannot be used together"
     )
+
+    # Validate dynamic_dit_loading requirements
+    if args.dynamic_dit_loading:
+        if not (args.dit and args.dit_high_noise):
+            raise ValueError("--dynamic_dit_loading requires both --dit and --dit_high_noise to be specified")
+        if args.lazy_loading:
+            logger.warning("--dynamic_dit_loading overrides --lazy_loading")
+            args.lazy_loading = False
+        if args.offload_inactive_dit:
+            logger.warning("--dynamic_dit_loading overrides --offload_inactive_dit")
+            args.offload_inactive_dit = False
 
     # Validate RamTorch and block_swap compatibility
     if args.ram_torch and args.blocks_to_swap > 0:
