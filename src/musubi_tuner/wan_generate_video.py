@@ -618,7 +618,20 @@ def cleanup_ramtorch_buffers():
         RamTorchLinear.B_BUFFERS[1] = None
         RamTorchLinear.W_GRAD_BUFFERS[0] = None
         RamTorchLinear.W_GRAD_BUFFERS[1] = None
-        logger.info("Cleared RamTorch global buffers")
+
+        # Reset buffer clocks
+        RamTorchLinear.FORWARD_BUFFER_CLK = 0
+        RamTorchLinear.BACKWARD_BUFFER_CLK = 0
+
+        # Recreate CUDA events and streams to clear any pending operations
+        if torch.cuda.is_available():
+            RamTorchLinear.TRANSFER_STREAM = torch.cuda.Stream()
+            RamTorchLinear.TRANSFER_FORWARD_FINISHED_EVENT = torch.cuda.Event()
+            RamTorchLinear.COMPUTE_FORWARD_START_EVENT = torch.cuda.Event()
+            RamTorchLinear.TRANSFER_BACKWARD_FINISHED_EVENT = torch.cuda.Event()
+            RamTorchLinear.COMPUTE_BACKWARD_START_EVENT = torch.cuda.Event()
+
+        logger.info("Cleared RamTorch global buffers and reset state")
 
 
 def unload_model_completely(model: torch.nn.Module, uses_ramtorch: bool = False):
@@ -635,24 +648,71 @@ def unload_model_completely(model: torch.nn.Module, uses_ramtorch: bool = False)
     # For RamTorch models, explicitly delete all parameters to free pinned memory
     if uses_ramtorch and RamTorchLinear is not None:
         logger.info("Unloading RamTorch model - freeing CPU pinned memory")
+
+        # First, move all modules to CPU and clear CUDA cache
+        model.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        # Collect and destroy all RamTorch parameters
         for name, module in model.named_modules():
             if isinstance(module, RamTorchLinear.Linear):
-                # Explicitly delete the parameters to free pinned memory
-                if hasattr(module, 'weight'):
-                    del module.weight
+                if hasattr(module, 'weight') and module.weight is not None:
+                    # For pinned memory, we need to create a new non-pinned tensor
+                    # This forces the old pinned memory to be released
+                    if module.weight.data.is_pinned():
+                        # Create new non-pinned tensor
+                        new_weight = torch.empty(0, device='cpu')
+                        # Replace the data
+                        module.weight.data = new_weight
+                    module.weight = None
+
                 if hasattr(module, 'bias') and module.bias is not None:
-                    del module.bias
+                    if module.bias.data.is_pinned():
+                        new_bias = torch.empty(0, device='cpu')
+                        module.bias.data = new_bias
+                    module.bias = None
 
         # Clear global buffers
         cleanup_ramtorch_buffers()
 
+        # Force synchronization
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    # Clear all remaining parameters
+    for param in model.parameters():
+        if param.is_pinned():
+            param.data = torch.empty(0, device='cpu')
+        else:
+            param.data = torch.empty(0)
+
+    # Delete all modules explicitly
+    for name, module in model.named_modules():
+        if hasattr(module, '__dict__'):
+            module.__dict__.clear()
+
     # Delete the model
     del model
 
-    # Force garbage collection
+    # Force aggressive garbage collection
+    import sys
+    # Clear reference cycles
+    gc.collect()
+    gc.collect()
     gc.collect()
 
-    # Clear GPU cache if available
+    # Try to force memory release back to OS (Linux specific)
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+        logger.info("Called malloc_trim to release memory to OS")
+    except:
+        pass  # Not on Linux or libc not available
+
+    # Clear GPU cache again
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
