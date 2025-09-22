@@ -771,14 +771,24 @@ def load_dit_model(
             if target_dtype is not None:
                 model = model.to(target_dtype)
 
-            # Then move all non-Linear modules to GPU
-            for name, module in model.named_modules():
-                if isinstance(module, RamTorchLinear.Linear if RamTorchLinear else type(None)):
-                    # Skip RamTorch Linear layers - they manage their own device placement
-                    continue
-                elif hasattr(module, 'weight') or hasattr(module, 'bias'):
-                    # This is a layer with parameters (Conv, BatchNorm, etc) - move to GPU
-                    module.to(device)
+            # Move all parameters and buffers to GPU except those in RamTorch Linear layers
+            for name, param in model.named_parameters():
+                # Check if this parameter belongs to a RamTorch Linear layer
+                is_ramtorch_param = False
+                for module_name, module in model.named_modules():
+                    if isinstance(module, RamTorchLinear.Linear if RamTorchLinear else type(None)):
+                        # Check if this parameter belongs to this RamTorch module
+                        if name.startswith(module_name + '.'):
+                            is_ramtorch_param = True
+                            break
+
+                if not is_ramtorch_param:
+                    # Move non-RamTorch parameters to GPU
+                    param.data = param.data.to(device)
+
+            # Also move buffers to GPU (buffers are things like running_mean in BatchNorm)
+            for name, buffer in model.named_buffers():
+                buffer.data = buffer.data.to(device)
 
     if args.compile:
         compile_backend, compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
