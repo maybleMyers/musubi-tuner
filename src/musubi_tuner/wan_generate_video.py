@@ -605,6 +605,60 @@ def load_dit_models(
     return [model]
 
 
+def cleanup_ramtorch_buffers():
+    """
+    Clean up RamTorch global buffers to free CPU memory.
+    This should be called when unloading a model that uses RamTorch.
+    """
+    if RamTorchLinear is not None:
+        # Clear the global buffers used by RamTorch
+        RamTorchLinear.W_BUFFERS[0] = None
+        RamTorchLinear.W_BUFFERS[1] = None
+        RamTorchLinear.B_BUFFERS[0] = None
+        RamTorchLinear.B_BUFFERS[1] = None
+        RamTorchLinear.W_GRAD_BUFFERS[0] = None
+        RamTorchLinear.W_GRAD_BUFFERS[1] = None
+        logger.info("Cleared RamTorch global buffers")
+
+
+def unload_model_completely(model: torch.nn.Module, uses_ramtorch: bool = False):
+    """
+    Completely unload a model from memory, including RamTorch buffers if applicable.
+
+    Args:
+        model: The model to unload
+        uses_ramtorch: Whether the model uses RamTorch Linear layers
+    """
+    if model is None:
+        return
+
+    # For RamTorch models, explicitly delete all parameters to free pinned memory
+    if uses_ramtorch and RamTorchLinear is not None:
+        logger.info("Unloading RamTorch model - freeing CPU pinned memory")
+        for name, module in model.named_modules():
+            if isinstance(module, RamTorchLinear.Linear):
+                # Explicitly delete the parameters to free pinned memory
+                if hasattr(module, 'weight'):
+                    del module.weight
+                if hasattr(module, 'bias') and module.bias is not None:
+                    del module.bias
+
+        # Clear global buffers
+        cleanup_ramtorch_buffers()
+
+    # Delete the model
+    del model
+
+    # Force garbage collection
+    gc.collect()
+
+    # Clear GPU cache if available
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logger.info("Model completely unloaded")
+
+
 def replace_linear_with_ramtorch(model: torch.nn.Module, device="cuda"):
     """
     Recursively replaces torch.nn.Linear with RamTorchLinear.
@@ -1510,13 +1564,10 @@ def run_sampling(
             if args.dynamic_dit_loading:
                 # Completely unload high noise model before loading low noise model
                 logger.info("Dynamic DiT loading: Completely unloading high noise model")
-                del model
-                model = None  # Clear reference
 
-                # Force cleanup
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
+                # Use the comprehensive unload function
+                unload_model_completely(model, uses_ramtorch=args.ram_torch)
+                model = None  # Clear reference
 
                 # Small delay to ensure cleanup completes
                 time.sleep(0.5)
