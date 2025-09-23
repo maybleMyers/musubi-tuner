@@ -611,110 +611,198 @@ def cleanup_ramtorch_buffers():
     This should be called when unloading a model that uses RamTorch.
     """
     if RamTorchLinear is not None:
-        # Clear the global buffers used by RamTorch
-        RamTorchLinear.W_BUFFERS[0] = None
-        RamTorchLinear.W_BUFFERS[1] = None
-        RamTorchLinear.B_BUFFERS[0] = None
-        RamTorchLinear.B_BUFFERS[1] = None
-        RamTorchLinear.W_GRAD_BUFFERS[0] = None
-        RamTorchLinear.W_GRAD_BUFFERS[1] = None
+        # Access the actual module's global buffers
+        import musubi_tuner.modules.linear as linear_module
+
+        # Clear forward buffers
+        linear_module.W_BUFFERS[0] = None
+        linear_module.W_BUFFERS[1] = None
+        linear_module.B_BUFFERS[0] = None
+        linear_module.B_BUFFERS[1] = None
+
+        # Clear backward buffers
+        linear_module.W_GRAD_BUFFERS[0] = None
+        linear_module.W_GRAD_BUFFERS[1] = None
 
         # Reset buffer clocks
-        RamTorchLinear.FORWARD_BUFFER_CLK = 0
-        RamTorchLinear.BACKWARD_BUFFER_CLK = 0
+        linear_module.FORWARD_BUFFER_CLK = 0
+        linear_module.BACKWARD_BUFFER_CLK = 0
 
-        # Recreate CUDA events and streams to clear any pending operations
+        # Synchronize CUDA streams before recreating
         if torch.cuda.is_available():
-            RamTorchLinear.TRANSFER_STREAM = torch.cuda.Stream()
-            RamTorchLinear.TRANSFER_FORWARD_FINISHED_EVENT = torch.cuda.Event()
-            RamTorchLinear.COMPUTE_FORWARD_START_EVENT = torch.cuda.Event()
-            RamTorchLinear.TRANSFER_BACKWARD_FINISHED_EVENT = torch.cuda.Event()
-            RamTorchLinear.COMPUTE_BACKWARD_START_EVENT = torch.cuda.Event()
+            # Wait for any pending transfers
+            try:
+                linear_module.TRANSFER_STREAM.synchronize()
+            except:
+                pass
+
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+            # Recreate CUDA events and streams to clear any pending operations
+            linear_module.TRANSFER_STREAM = torch.cuda.Stream()
+            linear_module.TRANSFER_FORWARD_FINISHED_EVENT = torch.cuda.Event()
+            linear_module.COMPUTE_FORWARD_START_EVENT = torch.cuda.Event()
+            linear_module.TRANSFER_BACKWARD_FINISHED_EVENT = torch.cuda.Event()
+            linear_module.COMPUTE_BACKWARD_START_EVENT = torch.cuda.Event()
+
+        # Force garbage collection
+        gc.collect()
+
+        # On Linux, release memory back to OS
+        if platform.system() == "Linux":
+            try:
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except:
+                pass
 
         logger.info("Cleared RamTorch global buffers and reset state")
 
 
-def unload_model_completely(model: torch.nn.Module, uses_ramtorch: bool = False):
+def unload_model_completely(model: torch.nn.Module, uses_ramtorch: bool = False, log_memory: bool = True):
     """
     Completely unload a model from memory, including RamTorch buffers if applicable.
 
     Args:
         model: The model to unload
         uses_ramtorch: Whether the model uses RamTorch Linear layers
+        log_memory: Whether to log memory usage before and after
     """
     if model is None:
         return
 
-    # For RamTorch models, explicitly delete all parameters to free pinned memory
-    if uses_ramtorch and RamTorchLinear is not None:
-        logger.info("Unloading RamTorch model - freeing CPU pinned memory")
+    logger.info("Starting complete model unload...")
 
-        # First, move all modules to CPU and clear CUDA cache
-        model.cpu()
+    # Track memory before unloading
+    if log_memory:
+        try:
+            import psutil
+            cpu_memory_before = psutil.Process().memory_info().rss / 1024**3
+            gpu_memory_before = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+            logger.info(f"Memory before unload - CPU: {cpu_memory_before:.2f} GB, GPU: {gpu_memory_before:.2f} GB")
+        except:
+            pass
+
+    # First, move model to CPU to free GPU memory
+    try:
+        model = model.cpu()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+    except Exception as e:
+        logger.warning(f"Error moving model to CPU: {e}")
 
-        # Collect and destroy all RamTorch parameters
+    # If using RamTorch, handle special cleanup
+    if uses_ramtorch and RamTorchLinear is not None:
+        logger.info("Cleaning up RamTorch Linear layers...")
+
+        # Clear all RamTorch Linear layer weights
         for name, module in model.named_modules():
             if isinstance(module, RamTorchLinear.Linear):
-                if hasattr(module, 'weight') and module.weight is not None:
-                    # For pinned memory, we need to create a new non-pinned tensor
-                    # This forces the old pinned memory to be released
-                    if module.weight.data.is_pinned():
-                        # Create new non-pinned tensor
-                        new_weight = torch.empty(0, device='cpu')
-                        # Replace the data
-                        module.weight.data = new_weight
-                    module.weight = None
+                try:
+                    # Clear weight and bias tensors
+                    if hasattr(module, "weight") and module.weight is not None:
+                        if hasattr(module.weight, "data"):
+                            # Replace with empty tensor to release pinned memory
+                            module.weight.data = torch.empty(0, device="cpu", pin_memory=False)
+                        module.weight = None
 
-                if hasattr(module, 'bias') and module.bias is not None:
-                    if module.bias.data.is_pinned():
-                        new_bias = torch.empty(0, device='cpu')
-                        module.bias.data = new_bias
-                    module.bias = None
+                    if hasattr(module, "bias") and module.bias is not None:
+                        if hasattr(module.bias, "data"):
+                            # Replace with empty tensor to release pinned memory
+                            module.bias.data = torch.empty(0, device="cpu", pin_memory=False)
+                        module.bias = None
 
-        # Clear global buffers
+                except Exception as e:
+                    logger.warning(f"Error cleaning up RamTorch layer {name}: {e}")
+
+        # Clear global RamTorch buffers
         cleanup_ramtorch_buffers()
 
-        # Force synchronization
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-    # Clear all remaining parameters
+    # Clear all module parameters and buffers
     try:
-        for param in model.parameters():
-            if param.is_pinned():
-                param.data = torch.empty(0, device='cpu')
-            else:
-                param.data = torch.empty(0)
-    except:
-        pass  # Model might be partially destroyed
+        # First clear all parameters
+        for name, param in model.named_parameters():
+            if param is not None:
+                # Replace pinned memory with regular memory
+                if hasattr(param, "data") and param.data.is_pinned():
+                    param.data = torch.empty(0, device="cpu", pin_memory=False)
+                param.data = None
 
-    # Delete the model
+        # Clear all buffers
+        for name, buffer in model.named_buffers():
+            if buffer is not None:
+                if hasattr(buffer, "data"):
+                    buffer.data = None
+
+        # Clear module internals
+        for module in model.modules():
+            if hasattr(module, '_parameters'):
+                module._parameters.clear()
+            if hasattr(module, '_buffers'):
+                module._buffers.clear()
+            # Clear any cached values
+            if hasattr(module, '_forward_hooks'):
+                module._forward_hooks.clear()
+            if hasattr(module, '_backward_hooks'):
+                module._backward_hooks.clear()
+
+    except Exception as e:
+        logger.warning(f"Error clearing model internals: {e}")
+
+    # Delete the model object
+    model_id = id(model)
     del model
 
-    # Force aggressive garbage collection
-    import sys
-    # Clear reference cycles
-    gc.collect()
-    gc.collect()
-    gc.collect()
+    # Force multiple rounds of garbage collection
+    for _ in range(3):
+        gc.collect()
 
-    # Try to force memory release back to OS (Linux specific)
-    try:
-        import ctypes
-        libc = ctypes.CDLL("libc.so.6")
-        libc.malloc_trim(0)
-        logger.info("Called malloc_trim to release memory to OS")
-    except:
-        pass  # Not on Linux or libc not available
-
-    # Clear GPU cache again
+    # Clear CUDA caches
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
 
-    logger.info("Model completely unloaded")
+    # Platform-specific memory release
+    if platform.system() == "Linux":
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+            logger.info("Performed malloc_trim to release memory to OS")
+        except Exception:
+            pass
+    elif platform.system() == "Windows":
+        # Windows doesn't have malloc_trim, but we can try to compact the heap
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            heap = kernel32.GetProcessHeap()
+            kernel32.HeapCompact(heap, 0)
+        except Exception:
+            pass
+
+    # Log memory after unloading
+    if log_memory:
+        try:
+            import psutil
+            # Small delay to let OS reclaim memory
+            time.sleep(0.5)
+            cpu_memory_after = psutil.Process().memory_info().rss / 1024**3
+            gpu_memory_after = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+            cpu_freed = cpu_memory_before - cpu_memory_after
+            gpu_freed = gpu_memory_before - gpu_memory_after
+            logger.info(f"Memory after unload - CPU: {cpu_memory_after:.2f} GB (freed: {cpu_freed:.2f} GB), GPU: {gpu_memory_after:.2f} GB (freed: {gpu_freed:.2f} GB)")
+
+            if cpu_freed < 1.0 and uses_ramtorch:
+                logger.warning(f"Warning: Only {cpu_freed:.2f} GB of CPU memory was freed. Model may not be fully unloaded.")
+        except:
+            pass
+
+    logger.info(f"Model (id={model_id}) unload completed")
 
 
 def replace_linear_with_ramtorch(model: torch.nn.Module, device="cuda"):
@@ -789,6 +877,17 @@ def load_dit_model(
         WanModel: loaded DiT model
     """
 
+    # Log memory at start of model loading
+    model_name = "high noise" if "high_noise" in dit_path else "low noise"
+    logger.info(f"Loading {model_name} DiT model from: {dit_path}")
+    try:
+        import psutil
+        cpu_start = psutil.Process().memory_info().rss / 1024**3
+        gpu_start = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+        logger.info(f"Memory at start of {model_name} model load - CPU: {cpu_start:.2f} GB, GPU: {gpu_start:.2f} GB")
+    except:
+        pass
+
     # If LyCORIS is enabled, we will load the model to CPU and then merge LoRA weights (static method)
 
     loading_device = "cpu"
@@ -857,11 +956,30 @@ def load_dit_model(
     # Apply RamTorch optimization if requested
     if args.ram_torch:
         if RamTorchLinear is not None:
+            # Log memory before applying RamTorch
+            try:
+                import psutil
+                cpu_before = psutil.Process().memory_info().rss / 1024**3
+                gpu_before = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+                logger.info(f"Memory before RamTorch - CPU: {cpu_before:.2f} GB, GPU: {gpu_before:.2f} GB")
+            except:
+                pass
+
             logger.info("Applying RamTorch - model weights will stay in CPU RAM")
             # Ensure model is on CPU before replacement
             if not isinstance(loading_device, str) or loading_device != "cpu":
                 model.to("cpu")
             replace_linear_with_ramtorch(model, device=str(device))
+
+            # Log memory after applying RamTorch
+            try:
+                import psutil
+                cpu_after = psutil.Process().memory_info().rss / 1024**3
+                gpu_after = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+                logger.info(f"Memory after RamTorch - CPU: {cpu_after:.2f} GB (delta: {cpu_after-cpu_before:+.2f} GB), GPU: {gpu_after:.2f} GB")
+            except:
+                pass
+
             logger.info("RamTorch applied - Linear layer weights are in CPU RAM, will transfer on-demand")
         else:
             logger.warning("RamTorch module not available. --ram_torch flag ignored.")
@@ -939,6 +1057,15 @@ def load_dit_model(
 
     model.eval().requires_grad_(False)
     clean_memory_on_device(device)
+
+    # Log memory at end of model loading
+    try:
+        import psutil
+        cpu_end = psutil.Process().memory_info().rss / 1024**3
+        gpu_end = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+        logger.info(f"Memory after {model_name} model load - CPU: {cpu_end:.2f} GB (delta: {cpu_end-cpu_start:+.2f} GB), GPU: {gpu_end:.2f} GB (delta: {gpu_end-gpu_start:+.2f} GB)")
+    except:
+        pass
 
     return model
 
@@ -1623,13 +1750,29 @@ def run_sampling(
                 # Completely unload high noise model before loading low noise model
                 logger.info("Dynamic DiT loading: Completely unloading high noise model")
 
-                # Use the comprehensive unload function
-                unload_model_completely(model, uses_ramtorch=args.ram_torch)
+                # Use the comprehensive unload function with memory logging
+                unload_model_completely(model, uses_ramtorch=args.ram_torch, log_memory=True)
                 model = None  # Clear reference
+                models[0] = None  # Also clear from models list if applicable
 
                 # Small delay to ensure cleanup completes
                 time.sleep(0.5)
                 clean_memory_on_device(device)
+
+                # Extra cleanup for RamTorch
+                if args.ram_torch:
+                    # Additional garbage collection to ensure pinned memory is released
+                    for _ in range(2):
+                        gc.collect()
+
+                    # Try to release memory on Linux
+                    if platform.system() == "Linux":
+                        try:
+                            import ctypes
+                            libc = ctypes.CDLL("libc.so.6")
+                            libc.malloc_trim(0)
+                        except:
+                            pass
 
                 logger.info("High noise model unloaded, now loading low noise model")
                 # The low noise model will be loaded below in the "if model is None" block
