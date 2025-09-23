@@ -195,11 +195,12 @@ class CPUBouncingLinear(nn.Module):
         self.device = device
 
         # parameters live on CPU
+        # Note: Removed .share_memory_() to allow proper memory cleanup when unloading models
         self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, device="cpu").share_memory_().pin_memory()
+            torch.empty(out_features, in_features, device="cpu").pin_memory()
         )
         self.bias = (
-            nn.Parameter(torch.empty(out_features, device="cpu").share_memory_().pin_memory())
+            nn.Parameter(torch.empty(out_features, device="cpu").pin_memory())
             if bias
             else None
         )

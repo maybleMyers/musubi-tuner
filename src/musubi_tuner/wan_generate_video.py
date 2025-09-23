@@ -682,16 +682,14 @@ def unload_model_completely(model: torch.nn.Module, uses_ramtorch: bool = False)
             torch.cuda.synchronize()
 
     # Clear all remaining parameters
-    for param in model.parameters():
-        if param.is_pinned():
-            param.data = torch.empty(0, device='cpu')
-        else:
-            param.data = torch.empty(0)
-
-    # Delete all modules explicitly
-    for name, module in model.named_modules():
-        if hasattr(module, '__dict__'):
-            module.__dict__.clear()
+    try:
+        for param in model.parameters():
+            if param.is_pinned():
+                param.data = torch.empty(0, device='cpu')
+            else:
+                param.data = torch.empty(0)
+    except:
+        pass  # Model might be partially destroyed
 
     # Delete the model
     del model
