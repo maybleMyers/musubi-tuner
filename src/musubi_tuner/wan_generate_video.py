@@ -563,6 +563,163 @@ def load_clip_model(args: argparse.Namespace, config, device: torch.device) -> C
     return clip
 
 
+class DynamicModelManager:
+    """Manages dynamic loading and unloading of models during inference."""
+
+    def __init__(self, config, device, dit_dtype, dit_weight_dtype, args):
+        self.config = config
+        self.device = device
+        self.dit_dtype = dit_dtype
+        self.dit_weight_dtype = dit_weight_dtype
+        self.args = args
+        self.current_model = None
+        self.current_model_type = None  # 'low' or 'high'
+        self.model_paths = {}
+        self.lora_weights_list_low = None
+        self.lora_multipliers_low = None
+        self.lora_weights_list_high = None
+        self.lora_multipliers_high = None
+
+    def set_model_paths(self, low_path: str, high_path: str):
+        """Set the paths for low and high noise models."""
+        self.model_paths['low'] = low_path
+        self.model_paths['high'] = high_path
+
+    def set_lora_weights(self, lora_weights_list_low, lora_multipliers_low,
+                        lora_weights_list_high, lora_multipliers_high):
+        """Save LoRA weights to apply to dynamically loaded models."""
+        self.lora_weights_list_low = lora_weights_list_low
+        self.lora_multipliers_low = lora_multipliers_low
+        self.lora_weights_list_high = lora_weights_list_high
+        self.lora_multipliers_high = lora_multipliers_high
+
+    def get_model(self, model_type: str) -> WanModel:
+        """Load the requested model if not already loaded."""
+        if self.current_model_type == model_type:
+            return self.current_model
+
+        # Unload current model if exists
+        if self.current_model is not None:
+            logger.info(f"Unloading {self.current_model_type} noise model...")
+
+            # Get memory usage before unloading
+            if torch.cuda.is_available():
+                memory_before = torch.cuda.memory_allocated(self.device) / 1024**3
+                logger.info(f"GPU memory before unload: {memory_before:.2f} GB")
+
+            # Monitor CPU memory
+            try:
+                import psutil
+                cpu_memory_before = psutil.Process().memory_info().rss / 1024**3
+                logger.info(f"CPU memory before model unload: {cpu_memory_before:.2f} GB")
+            except:
+                cpu_memory_before = 0
+
+            # Clear model blocks if they exist
+            try:
+                # Clear torch.compile cache if model was compiled
+                if self.args.compile:
+                    logger.info("Clearing torch.compile cache for model deletion")
+                    torch._dynamo.reset()
+
+                # Clear individual block references
+                if hasattr(self.current_model, 'blocks') and self.current_model.blocks is not None:
+                    logger.info(f"Clearing {len(self.current_model.blocks)} model blocks")
+                    for i in range(len(self.current_model.blocks)):
+                        self.current_model.blocks[i] = None
+                    self.current_model.blocks.clear()
+                    self.current_model.blocks = None
+
+                # Clear other model components
+                if hasattr(self.current_model, 'patch_embed'):
+                    self.current_model.patch_embed = None
+                if hasattr(self.current_model, 'norm'):
+                    self.current_model.norm = None
+
+                # Move any remaining parameters to CPU
+                self.current_model = self.current_model.cpu()
+            except Exception as e:
+                logger.warning(f"Error during model cleanup: {e}")
+
+            # If using RamTorch, clean up buffers
+            if self.args.ram_torch:
+                cleanup_ramtorch_buffers()
+
+            # Force model deletion
+            del self.current_model
+            self.current_model = None
+            self.current_model_type = None
+
+            # Aggressive cleanup
+            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.ipc_collect()
+
+            for _ in range(3):
+                gc.collect()
+
+            # Platform-specific memory release
+            if platform.system() == "Linux":
+                try:
+                    import ctypes
+                    libc = ctypes.CDLL("libc.so.6")
+                    libc.malloc_trim(0)
+                except:
+                    pass
+
+            clean_memory_on_device(self.device)
+
+            # Log memory usage after unloading
+            if torch.cuda.is_available():
+                memory_after = torch.cuda.memory_allocated(self.device) / 1024**3
+                logger.info(f"GPU memory after unload: {memory_after:.2f} GB (freed: {memory_before - memory_after:.2f} GB)")
+
+            try:
+                import psutil
+                cpu_memory_after = psutil.Process().memory_info().rss / 1024**3
+                cpu_freed = cpu_memory_before - cpu_memory_after
+                logger.info(f"CPU memory after model unload: {cpu_memory_after:.2f} GB (freed: {cpu_freed:.2f} GB)")
+            except:
+                pass
+
+        # Load new model
+        logger.info(f"Loading {model_type} noise model...")
+
+        # Select appropriate LoRA weights for this model type
+        lora_weights = None
+        lora_multipliers = None
+        if model_type == 'low':
+            lora_weights = self.lora_weights_list_low
+            lora_multipliers = self.lora_multipliers_low
+        else:  # 'high'
+            lora_weights = self.lora_weights_list_high
+            lora_multipliers = self.lora_multipliers_high
+
+        # Load model
+        model = load_dit_model(
+            self.args,
+            self.model_paths[model_type],
+            lora_weights,
+            lora_multipliers,
+            self.config,
+            self.device,
+            self.dit_weight_dtype
+        )
+
+        self.current_model = model
+        self.current_model_type = model_type
+        return model
+
+    def cleanup(self):
+        """Clean up any loaded models."""
+        if self.current_model is not None:
+            logger.info(f"Final cleanup of {self.current_model_type} noise model...")
+
+            # Use the same cleanup logic as in get_model
+            self.get_model(None)  # This will trigger unloading
+
+
 def load_dit_models(
     args: argparse.Namespace,
     config,
@@ -570,20 +727,43 @@ def load_dit_models(
     dit_dtype: torch.dtype,
     dit_weight_dtype: Optional[torch.dtype] = None,
     is_i2v: bool = False,
-) -> List[WanModel]:
+) -> Union[List[WanModel], Tuple]:
     """load DiT models
 
     Returns:
-        List[WanModel]: loaded DiT models. If args.dit_high_noise is specified, returns a list with two models: high noise and low noise.
+        For normal loading: List[WanModel]
+        For dynamic loading: Tuple with (low_path, high_path, lora_weights_low, lora_multipliers_low, lora_weights_high, lora_multipliers_high)
     """
     use_high_model = args.dit_high_noise is not None and len(args.dit_high_noise) > 0
-    if use_high_model and (args.lazy_loading or args.dynamic_dit_loading):
-        if args.lazy_loading:
-            logger.info("Using lazy loading")
-        else:
-            logger.info("Using dynamic DiT loading - models will be loaded on-demand")
+
+    # For dynamic loading, return paths and LoRA info instead of loaded models
+    if use_high_model and args.dynamic_dit_loading:
+        logger.info("Dynamic DiT loading enabled - returning model paths and LoRA info")
+
+        # Prepare LoRA weights if specified
+        lora_weights_list_low = None
+        lora_multipliers_low = None
+        if args.lora_weight is not None and len(args.lora_weight) > 0:
+            lora_weights_list_low = args.lora_weight
+            lora_multipliers_low = args.lora_multiplier if args.lora_multiplier else None
+
+        lora_weights_list_high = None
+        lora_multipliers_high = None
+        if args.lora_weight_high_noise is not None and len(args.lora_weight_high_noise) > 0:
+            lora_weights_list_high = args.lora_weight_high_noise
+            lora_multipliers_high = args.lora_multiplier_high_noise if hasattr(args, 'lora_multiplier_high_noise') else None
+
+        # Return paths and LoRA info for DynamicModelManager
+        return (args.dit, args.dit_high_noise,
+                lora_weights_list_low, lora_multipliers_low,
+                lora_weights_list_high, lora_multipliers_high)
+
+    # Legacy lazy loading support
+    if use_high_model and args.lazy_loading:
+        logger.info("Using lazy loading")
         return [None, None]  # models will be loaded on demand
 
+    # Normal loading - load models immediately
     model = load_dit_model(args, args.dit, args.lora_weight, args.lora_multiplier, config, device, dit_weight_dtype)
 
     if use_high_model:
@@ -1651,10 +1831,11 @@ def run_sampling(
     accelerator: Accelerator,
     is_i2v: bool = False,
     use_cpu_offload: bool = True,
+    model_manager: Optional[DynamicModelManager] = None,
 ) -> torch.Tensor:
     """run sampling
     Args:
-        models: dit models
+        models: dit models (can be None if using model_manager)
         noise: initial noise
         scheduler: scheduler for sampling
         timesteps: time steps for sampling
@@ -1665,6 +1846,7 @@ def run_sampling(
         accelerator: Accelerator instance
         is_i2v: I2V mode (False means T2V mode)
         use_cpu_offload: Whether to offload tensors to CPU during processing
+        model_manager: DynamicModelManager for dual-dit models
     Returns:
         torch.Tensor: generated latent
     """
@@ -1728,92 +1910,79 @@ def run_sampling(
     slg_start_step = int(args.slg_start * num_timesteps)
     slg_end_step = int(args.slg_end * num_timesteps)
 
-    prev_high_noise = args.timestep_boundary is not None
-    if prev_high_noise:
-        model = models[0]
-        guidance_scale = args.guidance_scale_high_noise
+    # Initialize model based on whether we're using DynamicModelManager
+    model = None
+    if model_manager is not None:
+        # Determine which model to load first based on timesteps
+        boundary = args.timestep_boundary * 1000 if args.timestep_boundary else 0
+        if len(timesteps) > 0:
+            if timesteps[0].item() >= boundary:
+                logger.info("Preloading high noise model before sampling loop...")
+                model = model_manager.get_model('high')
+                guidance_scale = args.guidance_scale_high_noise
+            else:
+                logger.info("Preloading low noise model before sampling loop...")
+                model = model_manager.get_model('low')
+                guidance_scale = args.guidance_scale
     else:
-        model = models[-1]  # use low noise model for low noise steps
-        guidance_scale = args.guidance_scale
+        # Legacy code path for non-dynamic loading
+        prev_high_noise = args.timestep_boundary is not None
+        if prev_high_noise:
+            model = models[0]
+            guidance_scale = args.guidance_scale_high_noise
+        else:
+            model = models[-1]
+            guidance_scale = args.guidance_scale
 
     logger.info(
-        f"Starting sampling (high noise: {prev_high_noise}). Models: {len(models)}, timestep boundary: {args.timestep_boundary}, flow shift: {args.flow_shift}, guidance scale: {guidance_scale}"
+        f"Starting sampling. Timestep boundary: {args.timestep_boundary}, flow shift: {args.flow_shift}, guidance scale: {guidance_scale}"
     )
 
     for i, t in enumerate(tqdm(timesteps)):
-        is_high_noise = (t / 1000.0) >= args.timestep_boundary if args.timestep_boundary is not None else False
-
-        if not is_high_noise and prev_high_noise:
-            guidance_scale = args.guidance_scale
-            logger.info(f"Switching to low noise at step {i}, t={t}, guidance_scale={guidance_scale}")
-
-            if args.dynamic_dit_loading:
-                # Completely unload high noise model before loading low noise model
-                logger.info("Dynamic DiT loading: Completely unloading high noise model")
-
-                # Use the comprehensive unload function with memory logging
-                unload_model_completely(model, uses_ramtorch=args.ram_torch, log_memory=True)
-                model = None  # Clear reference
-                models[0] = None  # Also clear from models list if applicable
-
-                # Small delay to ensure cleanup completes
-                time.sleep(0.5)
-                clean_memory_on_device(device)
-
-                # Extra cleanup for RamTorch
-                if args.ram_torch:
-                    # Additional garbage collection to ensure pinned memory is released
-                    for _ in range(2):
-                        gc.collect()
-
-                    # Try to release memory on Linux
-                    if platform.system() == "Linux":
-                        try:
-                            import ctypes
-                            libc = ctypes.CDLL("libc.so.6")
-                            libc.malloc_trim(0)
-                        except:
-                            pass
-
-                logger.info("High noise model unloaded, now loading low noise model")
-                # The low noise model will be loaded below in the "if model is None" block
+        # Determine which model to use
+        if model_manager is not None:
+            # Dynamic model switching with DynamicModelManager
+            boundary = args.timestep_boundary * 1000 if args.timestep_boundary else 0
+            if t.item() >= boundary:
+                model = model_manager.get_model('high')
+                guidance_scale = args.guidance_scale_high_noise if hasattr(args, 'guidance_scale_high_noise') else args.guidance_scale
             else:
-                del model
-                gc.collect()
+                model = model_manager.get_model('low')
+                guidance_scale = args.guidance_scale
+        else:
+            # Legacy model switching code for backward compatibility
+            is_high_noise = (t / 1000.0) >= args.timestep_boundary if args.timestep_boundary is not None else False
 
-                if len(models) > 1 and (args.offload_inactive_dit or args.lazy_loading):
-                    if args.blocks_to_swap > 0:
-                        # prepare block swap for low noise model
-                        logger.info("Waiting for 5 seconds to finish block swap")
-                        time.sleep(5)
+            # Only handle explicit lazy loading here, not dynamic loading
+            if model is None and args.lazy_loading:
+                # lazy loading
+                dit_path = args.dit_high_noise if is_high_noise else args.dit
+                lora_weight = args.lora_weight_high_noise if is_high_noise else args.lora_weight
+                lora_multiplier = args.lora_multiplier_high_noise if is_high_noise else args.lora_multiplier
+                model = load_dit_model(
+                    args, dit_path, lora_weight, lora_multiplier, gen_settings.cfg, device, gen_settings.dit_weight_dtype
+                )
+            elif not is_high_noise and hasattr(args, '_prev_high_noise') and args._prev_high_noise:
+                # Manual switching for legacy code
+                guidance_scale = args.guidance_scale
+                logger.info(f"Switching to low noise at step {i}, t={t}, guidance_scale={guidance_scale}")
 
+                if len(models) > 1:
                     if args.offload_inactive_dit:
                         logger.info("Switching model to CPU/GPU for both low and high noise models")
                         models[0].to("cpu")
-
                         if args.blocks_to_swap > 0:
-                            # prepare block swap for low noise model
                             models[-1].move_to_device_except_swap_blocks(device)
                             models[-1].prepare_block_swap_before_forward()
-
-                    else:  # lazy loading
-                        pass
-
                     gc.collect()
                     clean_memory_on_device(device)
+                    model = models[-1]  # use low noise model
 
-                model = models[-1]  # use low noise model for low noise steps
-
-        if model is None:
-            # lazy loading or dynamic loading
-            dit_path = args.dit_high_noise if is_high_noise else args.dit
-            lora_weight = args.lora_weight_high_noise if is_high_noise else args.lora_weight
-            lora_multiplier = args.lora_multiplier_high_noise if is_high_noise else args.lora_multiplier
-            model = load_dit_model(
-                args, dit_path, lora_weight, lora_multiplier, gen_settings.cfg, device, gen_settings.dit_weight_dtype
-            )
-
-        prev_high_noise = is_high_noise
+            # Track previous state for legacy code
+            if not hasattr(args, '_prev_high_noise'):
+                args._prev_high_noise = is_high_noise
+            else:
+                args._prev_high_noise = is_high_noise
 
         # latent is on CPU if use_cpu_offload is True
         latent_model_input = [latent.to(device)]
@@ -1931,7 +2100,21 @@ def generate(
             noise, inputs = prepare_t2v_inputs(args, cfg, accelerator, device, vae)
 
         # load DiT models
-        models = load_dit_models(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
+        model_result = load_dit_models(args, cfg, device, dit_dtype, dit_weight_dtype, is_i2v)
+
+        # Check if we got a tuple (dynamic loading) or list (normal loading)
+        model_manager = None
+        if isinstance(model_result, tuple):
+            # Dynamic loading - create DynamicModelManager
+            model_low_path, model_high_path, lora_weights_low, lora_multipliers_low, lora_weights_high, lora_multipliers_high = model_result
+            model_manager = DynamicModelManager(cfg, device, dit_dtype, dit_weight_dtype, args)
+            model_manager.set_model_paths(model_low_path, model_high_path)
+            model_manager.set_lora_weights(lora_weights_low, lora_multipliers_low, lora_weights_high, lora_multipliers_high)
+            models = None  # No pre-loaded models
+            logger.info("Using DynamicModelManager for dual-dit models")
+        else:
+            # Normal loading - use models directly
+            models = model_result
 
         # if we only want to save the model, we can skip the rest
         if args.save_merged_model:
@@ -1944,16 +2127,27 @@ def generate(
     seed_g = torch.Generator(device=device)
     seed_g.manual_seed(seed)
 
+    # Determine if we should use CPU offloading
+    use_cpu_offload = args.blocks_to_swap > 0 or args.ram_torch
+
     # run sampling
-    latent = run_sampling(models, noise, scheduler, timesteps, args, gen_settings, inputs, device, seed_g, accelerator, is_i2v)
+    latent = run_sampling(models, noise, scheduler, timesteps, args, gen_settings, inputs, device, seed_g, accelerator, is_i2v,
+                         use_cpu_offload=use_cpu_offload, model_manager=model_manager)
     if one_frame_inference_index is not None:
         latent = latent[:, one_frame_inference_index : one_frame_inference_index + 1, :]
         latent = latent.contiguous()  # safetensors requires contiguous tensors :(
 
     # Only clean up shared models if they were created within this function
     if shared_models is None:
+        # Clean up DynamicModelManager if used
+        if model_manager is not None:
+            logger.info("Cleaning up DynamicModelManager...")
+            model_manager.cleanup()
+            del model_manager
+
         # free memory
-        del models
+        if models is not None:
+            del models
         del scheduler
         synchronize_device(device)
 
