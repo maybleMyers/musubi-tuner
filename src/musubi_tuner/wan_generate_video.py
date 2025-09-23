@@ -625,9 +625,27 @@ class DynamicModelManager:
                 # Clear individual block references
                 if hasattr(self.current_model, 'blocks') and self.current_model.blocks is not None:
                     logger.info(f"Clearing {len(self.current_model.blocks)} model blocks")
+
+                    # If using RamTorch, clear Linear layers within each block first
+                    if self.args.ram_torch:
+                        for block_idx, block in enumerate(self.current_model.blocks):
+                            if block is not None and hasattr(block, 'modules'):
+                                # Clear all RamTorch Linear layers in this block
+                                for name, module in block.named_modules():
+                                    if RamTorchLinear and isinstance(module, RamTorchLinear.Linear):
+                                        if hasattr(module, 'weight') and module.weight is not None:
+                                            module.weight.data = torch.empty(0, device='cpu', pin_memory=False)
+                                            module.weight = None
+                                        if hasattr(module, 'bias') and module.bias is not None:
+                                            module.bias.data = torch.empty(0, device='cpu', pin_memory=False)
+                                            module.bias = None
+
+                    # Clear each block reference
                     for i in range(len(self.current_model.blocks)):
                         self.current_model.blocks[i] = None
-                    self.current_model.blocks.clear()
+
+                    # Delete the ModuleList (don't call .clear() as it doesn't exist)
+                    del self.current_model.blocks
                     self.current_model.blocks = None
 
                 # Clear other model components
@@ -635,6 +653,8 @@ class DynamicModelManager:
                     self.current_model.patch_embed = None
                 if hasattr(self.current_model, 'norm'):
                     self.current_model.norm = None
+                if hasattr(self.current_model, 'final_layer'):
+                    self.current_model.final_layer = None
 
                 # Move any remaining parameters to CPU
                 self.current_model = self.current_model.cpu()
