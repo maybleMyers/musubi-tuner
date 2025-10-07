@@ -592,11 +592,25 @@ def apply_rotary_emb_qwen(
 
         return out
     else:
-        x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        freqs_cis = freqs_cis.unsqueeze(1)
-        x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
+        # We will operate in FP32/Complex64 and return FP32
+        x_dtype = x.dtype
+        x_fp32 = x.to(torch.float32)
 
-        return x_out.type_as(x)
+        x_rotated = torch.view_as_complex(x_fp32.reshape(*x_fp32.shape[:-1], -1, 2))
+        
+        # Ensure freqs_cis is complex64
+        if freqs_cis.dtype != torch.complex64:
+             freqs_cis = freqs_cis.to(torch.complex64)
+        
+        freqs_cis = freqs_cis.unsqueeze(1) # [S, 1, D]
+        
+        # The multiplication is now complex64 * complex64
+        x_out_complex = x_rotated * freqs_cis
+        
+        x_out = torch.view_as_real(x_out_complex).flatten(3)
+
+        # Return the same dtype as the input to this function
+        return x_out.to(x_dtype)
 
 
 class Attention(nn.Module):
@@ -681,11 +695,10 @@ class Attention(nn.Module):
         if encoder_hidden_states is None:
             raise ValueError("QwenDoubleStreamAttnProcessor2_0 requires encoder_hidden_states (text stream)")
 
-        # =================== THIS IS THE CORRECTED LOGIC ===================
-        # 1. Get the original dtype immediately
+        # Store original dtype to cast back to at the end
         org_dtype = hidden_states.dtype
 
-        # 2. Perform initial projections. These are usually stable.
+        # Initial projections (usually safe in FP16)
         img_query = self.to_q(hidden_states)
         img_key = self.to_k(hidden_states)
         img_value = self.to_v(hidden_states)
@@ -704,40 +717,51 @@ class Attention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.heads, -1))
         txt_value = txt_value.unflatten(-1, (self.heads, -1))
 
-        # 3. Wrap ONLY the numerically sensitive parts in an FP32 autocast context
-        with torch.autocast(device_type=img_query.device.type, dtype=torch.float32, enabled=True):
-            # Apply QK normalization (These are now FP32 from our fp16_integration fix, but this ensures computation is also FP32)
-            img_query_fp32 = self.norm_q(img_query)
-            img_key_fp32 = self.norm_k(img_key)
-            txt_query_fp32 = self.norm_added_q(txt_query)
-            txt_key_fp32 = self.norm_added_k(txt_key)
+        # ================================================================= #
+        # V V V V V V V V V V MANUAL FP32 OPERATIONS V V V V V V V V V V V #
+        # ================================================================= #
+        # MANUALLY CAST ALL INPUTS TO FP32
+        img_query_fp32 = img_query.to(torch.float32)
+        img_key_fp32 = img_key.to(torch.float32)
+        img_value_fp32 = img_value.to(torch.float32)
+        txt_query_fp32 = txt_query.to(torch.float32)
+        txt_key_fp32 = txt_key.to(torch.float32)
+        txt_value_fp32 = txt_value.to(torch.float32)
 
-            # Apply RoPE
-            if image_rotary_emb is not None:
-                img_freqs, txt_freqs = image_rotary_emb
-                img_query_fp32 = apply_rotary_emb_qwen(img_query_fp32, img_freqs, use_real=False)
-                img_key_fp32 = apply_rotary_emb_qwen(img_key_fp32, img_freqs, use_real=False)
-                txt_query_fp32 = apply_rotary_emb_qwen(txt_query_fp32, txt_freqs, use_real=False)
-                txt_key_fp32 = apply_rotary_emb_qwen(txt_key_fp32, txt_freqs, use_real=False)
+        # Apply QK normalization in FP32
+        # Note: The norm layers themselves are already FP32 due to create_fp16_compatible_model
+        img_query_fp32 = self.norm_q(img_query_fp32)
+        img_key_fp32 = self.norm_k(img_key_fp32)
+        txt_query_fp32 = self.norm_added_q(txt_query_fp32)
+        txt_key_fp32 = self.norm_added_k(txt_key_fp32)
+        
+        # Apply RoPE in FP32
+        if image_rotary_emb is not None:
+            img_freqs, txt_freqs = image_rotary_emb
+            # Ensure freqs are also on the right device and dtype
+            img_freqs = [f.to(device=img_query_fp32.device, dtype=torch.complex64) for f in img_freqs] if isinstance(img_freqs, tuple) else img_freqs.to(device=img_query_fp32.device, dtype=torch.complex64)
+            txt_freqs = [f.to(device=txt_query_fp32.device, dtype=torch.complex64) for f in txt_freqs] if isinstance(txt_freqs, tuple) else txt_freqs.to(device=txt_query_fp32.device, dtype=torch.complex64)
             
-            seq_img = img_query_fp32.shape[1]
+            img_query_fp32 = apply_rotary_emb_qwen(img_query_fp32, img_freqs, use_real=False)
+            img_key_fp32 = apply_rotary_emb_qwen(img_key_fp32, img_freqs, use_real=False)
+            txt_query_fp32 = apply_rotary_emb_qwen(txt_query_fp32, txt_freqs, use_real=False)
+            txt_key_fp32 = apply_rotary_emb_qwen(txt_key_fp32, txt_freqs, use_real=False)
+        
+        seq_img = img_query_fp32.shape[1]
 
-            # Concatenate for joint attention
-            joint_query = torch.cat([img_query_fp32, txt_query_fp32], dim=1)
-            joint_key = torch.cat([img_key_fp32, txt_key_fp32], dim=1)
-            # Value doesn't need RoPE or norm, so we can cast it inside the context
-            joint_value = torch.cat([img_value, txt_value], dim=1).float()
+        # Concatenate for joint attention in FP32
+        joint_query = torch.cat([img_query_fp32, txt_query_fp32], dim=1)
+        joint_key = torch.cat([img_key_fp32, txt_key_fp32], dim=1)
+        joint_value = torch.cat([img_value_fp32, txt_value_fp32], dim=1)
 
-            # Compute joint attention
-            total_len = seq_img + txt_seq_lens
-            qkv = [joint_query, joint_key, joint_value]
-            joint_hidden_states = hunyuan_attention(
-                qkv, mode=self.attn_mode, attn_mask=attention_mask, total_len=total_len if self.split_attn else None
-            )
-        # End of FP32 autocast context
-        # =================================================================
+        # Compute joint attention in FP32
+        total_len = seq_img + txt_seq_lens
+        qkv = [joint_query, joint_key, joint_value]
+        joint_hidden_states = hunyuan_attention(
+            qkv, mode=self.attn_mode, attn_mask=attention_mask, total_len=total_len if self.split_attn else None
+        )
 
-        # 4. Cast back to original dtype
+        # MANUALLY CAST BACK to original dtype
         joint_hidden_states = joint_hidden_states.to(org_dtype)
 
         # Split attention outputs back
@@ -745,7 +769,7 @@ class Attention(nn.Module):
         txt_attn_output = joint_hidden_states[:, seq_img:, :]
         del joint_hidden_states
 
-        # Apply output projections
+        # Output projections (will run in FP16, which is fine)
         img_attn_output = self.to_out[0](img_attn_output)
         img_attn_output = self.to_out[1](img_attn_output)
 
