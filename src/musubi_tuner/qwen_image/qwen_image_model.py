@@ -846,67 +846,70 @@ class QwenImageTransformerBlock(nn.Module):
 
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            encoder_hidden_states: torch.Tensor,
-            encoder_hidden_states_mask: torch.Tensor,
-            temb: torch.Tensor,
-            image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-            txt_seq_lens: Optional[torch.Tensor] = None,
-            joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        txt_seq_lens: Optional[torch.Tensor] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        # Get modulation parameters for both streams
+        img_mod_params = self.img_mod(temb)
+        txt_mod_params = self.txt_mod(temb)
 
-            org_dtype = hidden_states.dtype
+        img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
+        txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
 
-            # Get modulation parameters for both streams
-            img_mod_params = self.img_mod(temb)
-            txt_mod_params = self.txt_mod(temb)
+        # Process image stream - norm1 + modulation
+        img_normed = self.img_norm1(hidden_states)
+        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1) # This now uses the clamped values
 
-            img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
-            txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
+        # Process text stream - norm1 + modulation
+        txt_normed = self.txt_norm1(encoder_hidden_states)
+        txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1) # This now uses the clamped values
 
-            # Process image stream - norm1 + modulation
-            img_normed = self.img_norm1(hidden_states)
-            img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
+        # Joint attention (keep the stable FP32 version)
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        attn_output = self.attn(
+            hidden_states=img_modulated,
+            encoder_hidden_states=txt_modulated,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            image_rotary_emb=image_rotary_emb,
+            txt_seq_lens=txt_seq_lens,
+            **joint_attention_kwargs,
+        )
+        img_attn_output, txt_attn_output = attn_output
+        
+        # Apply attention gates and add residual (back to original implementation)
+        hidden_states = hidden_states + img_gate1 * img_attn_output
+        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+        
+        # Process image stream - norm2 + MLP
+        img_normed2 = self.img_norm2(hidden_states)
+        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
+        img_mlp_output = self.img_mlp(img_modulated2)
+        
+        # Apply MLP gates and add residual
+        hidden_states = hidden_states + img_gate2 * img_mlp_output
+        
+        # Process text stream - norm2 + MLP
+        txt_normed2 = self.txt_norm2(encoder_hidden_states)
+        txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
+        txt_mlp_output = self.txt_mlp(txt_modulated2)
+        
+        # Apply MLP gates and add residual
+        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
 
-            # Process text stream - norm1 + modulation
-            txt_normed = self.txt_norm1(encoder_hidden_states)
-            txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
+        # Original clipping at the end
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
 
-            # Joint attention (now stable)
-            joint_attention_kwargs = joint_attention_kwargs or {}
-            attn_output = self.attn(
-                hidden_states=img_modulated,
-                encoder_hidden_states=txt_modulated,
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
-                image_rotary_emb=image_rotary_emb,
-                txt_seq_lens=txt_seq_lens,
-                **joint_attention_kwargs,
-            )
-            img_attn_output, txt_attn_output = attn_output
-
-            # Apply attention gates and add residual IN FLOAT32
-            hidden_states = hidden_states.float() + img_gate1.float() * img_attn_output.float()
-            encoder_hidden_states = encoder_hidden_states.float() + txt_gate1.float() * txt_attn_output.float()
-
-            # Process image stream - norm2 + MLP
-            img_normed2 = self.img_norm2(hidden_states)
-            img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
-            img_mlp_output = self.img_mlp(img_modulated2)
-
-            # Apply MLP gates and add residual IN FLOAT32
-            hidden_states = hidden_states + img_gate2.float() * img_mlp_output.float()
-
-            # Process text stream - norm2 + MLP
-            txt_normed2 = self.txt_norm2(encoder_hidden_states)
-            txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
-            txt_mlp_output = self.txt_mlp(txt_modulated2)
-
-            # Apply MLP gates and add residual IN FLOAT32
-            encoder_hidden_states = encoder_hidden_states + txt_gate2.float() * txt_mlp_output.float()
-
-            # Cast back to original dtype at the end of the block
-            return encoder_hidden_states.to(org_dtype), hidden_states.to(org_dtype)
+        return encoder_hidden_states, hidden_states
 
 class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin):
     """
