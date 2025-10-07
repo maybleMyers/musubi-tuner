@@ -702,41 +702,42 @@ class Attention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.heads, -1))
         txt_value = txt_value.unflatten(-1, (self.heads, -1))
 
-        # Apply QK normalization
-        img_query = self.norm_q(img_query)
-        img_key = self.norm_k(img_key)
-        txt_query = self.norm_added_q(txt_query)
-        txt_key = self.norm_added_k(txt_key)
+        # Store original dtype
+        org_dtype = hidden_states.dtype
+        with torch.autocast(device_type=hidden_states.device.type, dtype=torch.float32, enabled=True):
+            # Apply QK normalization
+            img_query = self.norm_q(img_query)
+            img_key = self.norm_k(img_key)
+            txt_query = self.norm_added_q(txt_query)
+            txt_key = self.norm_added_k(txt_key)
 
-        # Apply RoPE
-        if image_rotary_emb is not None:
-            img_freqs, txt_freqs = image_rotary_emb
-            img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
-            img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
-            txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
-            txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
-        seq_img = img_query.shape[1]
+            # Apply RoPE
+            if image_rotary_emb is not None:
+                img_freqs, txt_freqs = image_rotary_emb
+                img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
+                img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
+                txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
+                txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+            seq_img = img_query.shape[1]
 
-        # Concatenate for joint attention
-        # Order: [image, txt]
-        joint_query = torch.cat([img_query, txt_query], dim=1)
-        del img_query, txt_query
-        joint_key = torch.cat([img_key, txt_key], dim=1)
-        del img_key, txt_key
-        joint_value = torch.cat([img_value, txt_value], dim=1)
-        del img_value, txt_value
+            # Concatenate for joint attention
+            # Order: [image, txt]
+            joint_query = torch.cat([img_query, txt_query], dim=1)
+            del img_query, txt_query
+            joint_key = torch.cat([img_key, txt_key], dim=1)
+            del img_key, txt_key
+            joint_value = torch.cat([img_value, txt_value], dim=1)
+            del img_value, txt_value
 
-        # Compute joint attention
-        # joint_query: [B, S, H, D], joint_key: [B, S, H, D], joint_value: [B, S, H, D]
-        total_len = seq_img + txt_seq_lens
-        qkv = [joint_query, joint_key, joint_value]
-        org_dtype = joint_query.dtype
-        del joint_query, joint_key, joint_value
-        joint_hidden_states = hunyuan_attention(
-            qkv, mode=self.attn_mode, attn_mask=attention_mask, total_len=total_len if self.split_attn else None
-        )
-        # joint_hidden_states: [B, S, H*D]
+            # Compute joint attention
+            total_len = seq_img + txt_seq_lens
+            qkv = [joint_query, joint_key, joint_value]
+            del joint_query, joint_key, joint_value
+            joint_hidden_states = hunyuan_attention(
+                qkv, mode=self.attn_mode, attn_mask=attention_mask, total_len=total_len if self.split_attn else None
+            )
 
+        # The context manager automatically handles casting back, but we'll be explicit.
         joint_hidden_states = joint_hidden_states.to(org_dtype)
 
         # Split attention outputs back
