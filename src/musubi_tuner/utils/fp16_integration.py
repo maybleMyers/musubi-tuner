@@ -10,7 +10,7 @@ import torch.nn as nn
 from typing import Optional, Dict, Any, Tuple, Union
 import logging
 from contextlib import nullcontext
-
+from musubi_tuner.qwen_image import qwen_image_model
 from .fp16_utils import (
     DynamicLossScaler,
     FP16MasterWeights,
@@ -389,7 +389,8 @@ def create_fp16_compatible_model(model: nn.Module, dtype: torch.dtype = torch.fl
     # Keep normalization layers in fp32 for stability
     for module in model.modules():
         if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
-                              nn.LayerNorm, nn.GroupNorm)):
+                              nn.LayerNorm, nn.GroupNorm, qwen_image_model.RMSNorm,
+                              qwen_image_model.AdaLayerNormContinuous)):
             module.float()
             logger.debug(f"Keeping {module.__class__.__name__} in fp32 for stability")
     
