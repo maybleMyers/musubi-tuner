@@ -837,7 +837,7 @@ class QwenImageTransformerBlock(nn.Module):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)
 
-    def forward(
+def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
@@ -847,49 +847,25 @@ class QwenImageTransformerBlock(nn.Module):
         txt_seq_lens: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        def check_nan(tensor, name):
-            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-                print(f"!!!!!!!!!!!!! NaN or Inf detected in: {name} !!!!!!!!!!!!!")
-                # import sys; sys.exit() # Uncomment to force stop for inspection
         
-        check_nan(hidden_states, "block input hidden_states")
-        check_nan(encoder_hidden_states, "block input encoder_hidden_states")
-        check_nan(temb, "block input temb")
-        # ================================================================= #
+        org_dtype = hidden_states.dtype
         
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod(temb)
         txt_mod_params = self.txt_mod(temb)
-        
-        # ================================================================= #
-        check_nan(img_mod_params, "img_mod_params from temb")
-        check_nan(txt_mod_params, "txt_mod_params from temb")
-        # ================================================================= #
-        
+
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
-        del img_mod_params
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
-        del txt_mod_params
 
         # Process image stream - norm1 + modulation
         img_normed = self.img_norm1(hidden_states)
         img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
-        del img_normed, img_mod1
-        
-        # ================================================================= #
-        check_nan(img_modulated, "img_modulated after norm1")
-        # ================================================================= #
 
         # Process text stream - norm1 + modulation
         txt_normed = self.txt_norm1(encoder_hidden_states)
         txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
-        del txt_normed, txt_mod1
 
-        # ================================================================= #
-        check_nan(txt_modulated, "txt_modulated after norm1")
-        # ================================================================= #
-
-        # Use QwenAttnProcessor2_0 for joint attention computation
+        # Joint attention (now stable)
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=img_modulated,
@@ -899,65 +875,30 @@ class QwenImageTransformerBlock(nn.Module):
             txt_seq_lens=txt_seq_lens,
             **joint_attention_kwargs,
         )
-        del img_modulated, txt_modulated
-
         img_attn_output, txt_attn_output = attn_output
-        del attn_output
-
-        # ================================================================= #
-        check_nan(img_attn_output, "img_attn_output from attention")
-        check_nan(txt_attn_output, "txt_attn_output from attention")
-        # ================================================================= #
         
-        # Apply attention gates and add residual
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-        del img_gate1, img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
-        del txt_gate1, txt_attn_output
-        
-        # ================================================================= #
-        check_nan(hidden_states, "hidden_states after attention residual")
-        check_nan(encoder_hidden_states, "encoder_hidden_states after attention residual")
-        # ================================================================= #
+        # Apply attention gates and add residual IN FLOAT32
+        hidden_states = hidden_states.float() + img_gate1.float() * img_attn_output.float()
+        encoder_hidden_states = encoder_hidden_states.float() + txt_gate1.float() * txt_attn_output.float()
 
         # Process image stream - norm2 + MLP
         img_normed2 = self.img_norm2(hidden_states)
         img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
-        del img_normed2, img_mod2
         img_mlp_output = self.img_mlp(img_modulated2)
-        del img_modulated2
         
-        # ================================================================= #
-        check_nan(img_mlp_output, "img_mlp_output")
-        # ================================================================= #
+        # Apply MLP gates and add residual IN FLOAT32
+        hidden_states = hidden_states + img_gate2.float() * img_mlp_output.float()
         
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
-        del img_gate2, img_mlp_output
-        
-        # ================================================================= #
-        check_nan(hidden_states, "hidden_states after mlp residual")
-        # ================================================================= #
-
         # Process text stream - norm2 + MLP
         txt_normed2 = self.txt_norm2(encoder_hidden_states)
         txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
-        del txt_normed2, txt_mod2
         txt_mlp_output = self.txt_mlp(txt_modulated2)
-        del txt_modulated2
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
-        del txt_gate2, txt_mlp_output
         
-        # ================================================================= #
-        check_nan(encoder_hidden_states, "encoder_hidden_states after mlp residual")
-        # ================================================================= #
+        # Apply MLP gates and add residual IN FLOAT32
+        encoder_hidden_states = encoder_hidden_states + txt_gate2.float() * txt_mlp_output.float()
 
-        # Clip to prevent overflow for fp16
-        if encoder_hidden_states.dtype == torch.float16:
-            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
-        if hidden_states.dtype == torch.float16:
-            hidden_states = hidden_states.clip(-65504, 65504)
-
-        return encoder_hidden_states, hidden_states
+        # Cast back to original dtype at the end of the block
+        return encoder_hidden_states.to(org_dtype), hidden_states.to(org_dtype)
 
 class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin):
     """
