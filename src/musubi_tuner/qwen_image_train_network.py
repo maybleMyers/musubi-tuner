@@ -350,6 +350,9 @@ class QwenImageNetworkTrainer(NetworkTrainer):
             args.fp8_scaled,
             num_layers=args.num_layers,
         )
+        if args.mixed_precision == "fp16":
+            logger.info("Preparing model for stable FP16 training by converting Norm layers to FP32.")
+            model = create_fp16_compatible_model(model, torch.float16)
         return model
 
     def scale_shift_latents(self, latents):
