@@ -390,7 +390,7 @@ def create_fp16_compatible_model(model: nn.Module, dtype: torch.dtype = torch.fl
     for module in model.modules():
         if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
                               nn.LayerNorm, nn.GroupNorm, qwen_image_model.RMSNorm,
-                              qwen_image_model.AdaLayerNormContinuous)):
+                              qwen_image_model.AdaLayerNormContinuous, qwen_image_model.AdaLayerNorm)):
             module.float()
             logger.debug(f"Keeping {module.__class__.__name__} in fp32 for stability")
     
