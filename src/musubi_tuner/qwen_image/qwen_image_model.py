@@ -681,19 +681,21 @@ class Attention(nn.Module):
         if encoder_hidden_states is None:
             raise ValueError("QwenDoubleStreamAttnProcessor2_0 requires encoder_hidden_states (text stream)")
 
-        # Compute QKV for image stream (sample projections)
+        # =================== THIS IS THE CORRECTED LOGIC ===================
+        # 1. Get the original dtype immediately
+        org_dtype = hidden_states.dtype
+
+        # 2. Perform initial projections. These are usually stable.
         img_query = self.to_q(hidden_states)
         img_key = self.to_k(hidden_states)
         img_value = self.to_v(hidden_states)
         del hidden_states
 
-        # Compute QKV for text stream (context projections)
         txt_query = self.add_q_proj(encoder_hidden_states)
         txt_key = self.add_k_proj(encoder_hidden_states)
         txt_value = self.add_v_proj(encoder_hidden_states)
         del encoder_hidden_states
-
-        # Reshape for multi-head attention
+        
         img_query = img_query.unflatten(-1, (self.heads, -1))
         img_key = img_key.unflatten(-1, (self.heads, -1))
         img_value = img_value.unflatten(-1, (self.heads, -1))
@@ -702,81 +704,50 @@ class Attention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.heads, -1))
         txt_value = txt_value.unflatten(-1, (self.heads, -1))
 
-        # Store original dtype
-        org_dtype = hidden_states.dtype
-        with torch.autocast(device_type=hidden_states.device.type, dtype=torch.float32, enabled=True):
-            # Apply QK normalization
-            img_query = self.norm_q(img_query)
-            img_key = self.norm_k(img_key)
-            txt_query = self.norm_added_q(txt_query)
-            txt_key = self.norm_added_k(txt_key)
+        # 3. Wrap ONLY the numerically sensitive parts in an FP32 autocast context
+        with torch.autocast(device_type=img_query.device.type, dtype=torch.float32, enabled=True):
+            # Apply QK normalization (These are now FP32 from our fp16_integration fix, but this ensures computation is also FP32)
+            img_query_fp32 = self.norm_q(img_query)
+            img_key_fp32 = self.norm_k(img_key)
+            txt_query_fp32 = self.norm_added_q(txt_query)
+            txt_key_fp32 = self.norm_added_k(txt_key)
 
             # Apply RoPE
             if image_rotary_emb is not None:
                 img_freqs, txt_freqs = image_rotary_emb
-                img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
-                img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
-                txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
-                txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
-            seq_img = img_query.shape[1]
+                img_query_fp32 = apply_rotary_emb_qwen(img_query_fp32, img_freqs, use_real=False)
+                img_key_fp32 = apply_rotary_emb_qwen(img_key_fp32, img_freqs, use_real=False)
+                txt_query_fp32 = apply_rotary_emb_qwen(txt_query_fp32, txt_freqs, use_real=False)
+                txt_key_fp32 = apply_rotary_emb_qwen(txt_key_fp32, txt_freqs, use_real=False)
+            
+            seq_img = img_query_fp32.shape[1]
 
             # Concatenate for joint attention
-            # Order: [image, txt]
-            joint_query = torch.cat([img_query, txt_query], dim=1)
-            del img_query, txt_query
-            joint_key = torch.cat([img_key, txt_key], dim=1)
-            del img_key, txt_key
-            joint_value = torch.cat([img_value, txt_value], dim=1)
-            del img_value, txt_value
+            joint_query = torch.cat([img_query_fp32, txt_query_fp32], dim=1)
+            joint_key = torch.cat([img_key_fp32, txt_key_fp32], dim=1)
+            # Value doesn't need RoPE or norm, so we can cast it inside the context
+            joint_value = torch.cat([img_value, txt_value], dim=1).float()
 
             # Compute joint attention
             total_len = seq_img + txt_seq_lens
             qkv = [joint_query, joint_key, joint_value]
-            del joint_query, joint_key, joint_value
             joint_hidden_states = hunyuan_attention(
                 qkv, mode=self.attn_mode, attn_mask=attention_mask, total_len=total_len if self.split_attn else None
             )
+        # End of FP32 autocast context
+        # =================================================================
 
-        # The context manager automatically handles casting back, but we'll be explicit.
+        # 4. Cast back to original dtype
         joint_hidden_states = joint_hidden_states.to(org_dtype)
 
         # Split attention outputs back
-        img_attn_output = joint_hidden_states[:, :seq_img, :]  # Image part
-        txt_attn_output = joint_hidden_states[:, seq_img:, :]  # Text part
+        img_attn_output = joint_hidden_states[:, :seq_img, :]
+        txt_attn_output = joint_hidden_states[:, seq_img:, :]
         del joint_hidden_states
-
-        # Original implementation
-        # ----
-        # # Concatenate for joint attention
-        # # Order: [text, image]
-        # joint_query = torch.cat([txt_query, img_query], dim=1)
-        # joint_key = torch.cat([txt_key, img_key], dim=1)
-        # joint_value = torch.cat([txt_value, img_value], dim=1)
-
-        # # Compute joint attention
-        # # joint_query: [B, S, H, D], joint_key: [B, S, H, D], joint_value: [B, S, H, D]
-        # joint_query = joint_query.transpose(1, 2)  # [B, H, S, D]
-        # joint_key = joint_key.transpose(1, 2)  # [B, H, S, D]
-        # joint_value = joint_value.transpose(1, 2)  # [B, H, S, D]
-        # joint_hidden_states = torch.nn.functional.scaled_dot_product_attention(
-        #     joint_query, joint_key, joint_value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        # )
-        # # joint_hidden_states: [B, H, S, D]
-        # joint_hidden_states = joint_hidden_states.transpose(1, 2)  # [B, S, H, D]
-        # # backend=self._attention_backend,
-
-        # # Reshape back
-        # joint_hidden_states = joint_hidden_states.flatten(2, 3)
-        # joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
-
-        # # Split attention outputs back
-        # txt_attn_output = joint_hidden_states[:, :seq_txt, :]  # Text part
-        # img_attn_output = joint_hidden_states[:, seq_txt:, :]  # Image part
-        # ----
 
         # Apply output projections
         img_attn_output = self.to_out[0](img_attn_output)
-        img_attn_output = self.to_out[1](img_attn_output)  # dropout
+        img_attn_output = self.to_out[1](img_attn_output)
 
         txt_attn_output = self.to_add_out(txt_attn_output)
 
