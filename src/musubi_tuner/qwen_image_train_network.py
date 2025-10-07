@@ -22,6 +22,11 @@ from musubi_tuner.hv_train_network import (
     setup_parser_common,
     read_config_from_file,
 )
+from musubi_tuner.utils.fp16_integration import (
+    FP16TrainingManager,
+    modify_args_for_fp16,
+    create_fp16_compatible_model,
+)
 import logging
 
 
@@ -47,11 +52,26 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         return ARCHITECTURE_QWEN_IMAGE_EDIT_FULL if self.is_edit else ARCHITECTURE_QWEN_IMAGE_FULL
 
     def handle_model_specific_args(self, args):
-        self.dit_dtype = torch.bfloat16
+        # Configure dtype based on mixed_precision setting
+        if args.mixed_precision == "fp16":
+            self.dit_dtype = torch.float16
+            # Modify args for safe fp16 training
+            modify_args_for_fp16(args)
+            logger.info("Configured for fp16 training with safety features")
+        elif args.mixed_precision == "bf16":
+            self.dit_dtype = torch.bfloat16
+            logger.info("Using bfloat16 precision")
+        else:
+            self.dit_dtype = torch.float32
+            logger.info("Using float32 precision")
+        
         self._i2v_training = False
         self._control_training = False
         self.default_guidance_scale = 1.0  # not used
         self.is_edit = args.edit or args.edit_plus
+        
+        # Initialize FP16 training manager if needed
+        self.fp16_manager = None  # Will be initialized later with the model
 
     def process_sample_prompts(
         self,
@@ -335,6 +355,21 @@ class QwenImageNetworkTrainer(NetworkTrainer):
     def scale_shift_latents(self, latents):
         return latents
 
+    def init_fp16_manager(self, model, args, accelerator):
+        """Initialize FP16 training manager if using fp16."""
+        if args.mixed_precision == "fp16":
+            self.fp16_manager = FP16TrainingManager(model, args, accelerator)
+            logger.info("FP16 training manager initialized")
+        return self.fp16_manager
+    
+    def compute_loss_safe(self, model_pred, target, args, accelerator):
+        """Compute loss with fp16 safety if needed."""
+        if self.fp16_manager:
+            return self.fp16_manager.compute_loss(model_pred, target, loss_fn="mse")
+        else:
+            # Standard loss computation
+            return torch.nn.functional.mse_loss(model_pred, target, reduction="mean")
+    
     def call_dit(
         self,
         args: argparse.Namespace,
@@ -423,7 +458,14 @@ class QwenImageNetworkTrainer(NetworkTrainer):
 
         guidance = None
         timesteps = timesteps / 1000.0
-        with accelerator.autocast():
+        
+        # Use appropriate autocast context
+        if self.fp16_manager:
+            autocast_ctx = self.fp16_manager.autocast_context()
+        else:
+            autocast_ctx = accelerator.autocast()
+        
+        with autocast_ctx:
             model_pred = model(
                 hidden_states=noisy_model_input,
                 timestep=timesteps,
@@ -462,6 +504,25 @@ def qwen_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--num_layers", type=int, default=None, help="Number of layers in the DiT model, default is None (60)")
     parser.add_argument("--edit", action="store_true", help="training for Qwen-Image-Edit")
     parser.add_argument("--edit_plus", action="store_true", help="training for Qwen-Image-Edit-2509 (with multiple control images)")
+    
+    # FP16 training specific arguments
+    parser.add_argument("--fp16_master_weights", action="store_true", default=True,
+                        help="Use fp32 master weights for fp16 training (recommended)")
+    parser.add_argument("--fp16_loss_scaling", action="store_true", default=True,
+                        help="Use dynamic loss scaling for fp16 training (recommended)")
+    parser.add_argument("--fp16_stochastic_rounding", action="store_true", default=True,
+                        help="Use stochastic rounding when converting fp32 to fp16")
+    parser.add_argument("--fp16_init_scale", type=float, default=2**15,
+                        help="Initial loss scale for fp16 training")
+    parser.add_argument("--fp16_scale_window", type=int, default=2000,
+                        help="Number of iterations before increasing loss scale")
+    parser.add_argument("--fp16_min_scale", type=float, default=1.0,
+                        help="Minimum loss scale for fp16 training")
+    parser.add_argument("--fp16_max_scale", type=float, default=2**24,
+                        help="Maximum loss scale for fp16 training")
+    parser.add_argument("--fp16_monitor_interval", type=int, default=100,
+                        help="Interval for logging fp16 training statistics")
+    
     return parser
 
 
@@ -472,9 +533,23 @@ def main():
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
 
-    args.dit_dtype = "bfloat16"  # DiT dtype is bfloat16
-    if args.vae_dtype is None:
-        args.vae_dtype = "bfloat16"  # make bfloat16 as default for VAE, this should be checked
+    # Set DiT dtype based on mixed_precision
+    if args.mixed_precision == "fp16":
+        args.dit_dtype = "float16"
+        # VAE should also be fp16 for consistency
+        if args.vae_dtype is None:
+            args.vae_dtype = "float16"
+        logger.info("Using fp16 precision for training")
+    elif args.mixed_precision == "bf16":
+        args.dit_dtype = "bfloat16"
+        if args.vae_dtype is None:
+            args.vae_dtype = "bfloat16"
+        logger.info("Using bfloat16 precision for training")
+    else:
+        args.dit_dtype = "float32"
+        if args.vae_dtype is None:
+            args.vae_dtype = "float32"
+        logger.info("Using float32 precision for training")
 
     trainer = QwenImageNetworkTrainer()
     trainer.train(args)
