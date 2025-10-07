@@ -1181,15 +1181,15 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         if input_device != hidden_states.device:
             hidden_states = hidden_states.to(input_device)
 
-        # Use only the image part (hidden_states) from the dual-stream blocks
-        hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
+        hidden_states_fp32 = hidden_states.to(torch.float32)
+        temb_fp32 = temb.to(torch.float32)
 
-        # if USE_PEFT_BACKEND:
-        #     # remove `lora_scale` from each PEFT layer
-        #     unscale_lora_layers(self, lora_scale)
-
-        return output
+        hidden_states_fp32 = self.norm_out(hidden_states_fp32, temb_fp32)
+        output = self.proj_out(hidden_states_fp32)
+        
+        # The output will be cast back down to fp16 automatically by accelerator.autocast,
+        # but the numerically sensitive operations were done in fp32.
+        return output.to(hidden_states.dtype)
 
 
 FP8_OPTIMIZATION_TARGET_KEYS = ["transformer_blocks"]
