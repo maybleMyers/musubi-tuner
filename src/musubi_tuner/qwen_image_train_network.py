@@ -535,6 +535,8 @@ def main():
 
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
+    
+    torch.autograd.set_detect_anomaly(True)
 
     # Set DiT dtype based on mixed_precision
     if args.mixed_precision == "fp16":

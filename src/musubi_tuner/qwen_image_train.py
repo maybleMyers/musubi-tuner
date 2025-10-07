@@ -520,7 +520,7 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
         clean_memory_on_device(accelerator.device)
 
         optimizer_train_fn()
-
+        torch.autograd.set_detect_anomaly(True)
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
