@@ -2021,49 +2021,38 @@ class NetworkTrainer:
                 lr_schedulers[i] = accelerator.prepare(lr_schedulers[i])
 
             # Build parameter to optimizer index mapping
-            parameter_optimizer_map = {}
-            num_parameters_per_group = [0] * len(optimizers)
+            # Use instance variables to match sd-scripts pattern (avoids closure issues)
+            self._fused_optimizer_map = {}  # param -> optimizer index
+            self._fused_num_params_per_group = [0] * len(optimizers)
+            self._fused_hooked_count = {i: 0 for i in range(len(optimizers))}
+            self._fused_optimizers = optimizers
+            self._fused_lr_schedulers = lr_schedulers
 
             # Rebuild the mapping from parameters to optimizer indices
             block_keys_sorted = sorted(param_groups_by_block.keys(), key=lambda x: (x[0], x[1]))
             for opt_idx, block_key in enumerate(block_keys_sorted):
                 for param in param_groups_by_block[block_key]:
                     if param.requires_grad:
-                        parameter_optimizer_map[param] = opt_idx
-                        num_parameters_per_group[opt_idx] += 1
+                        self._fused_optimizer_map[param] = opt_idx
+                        self._fused_num_params_per_group[opt_idx] += 1
 
-            # Counter for tracking when all params in a group have gradients
-            optimizer_hooked_count = {}
+            # Register hooks on each parameter - following sd-scripts pattern exactly
+            for param in self._fused_optimizer_map.keys():
+                def grad_hook(tensor: torch.Tensor, trainer=self, acc=accelerator, a=args):
+                    # Clip gradients if needed
+                    if acc.sync_gradients and a.max_grad_norm != 0.0:
+                        acc.clip_grad_norm_(tensor, a.max_grad_norm)
 
-            def reset_optimizer_hooked_count():
-                nonlocal optimizer_hooked_count
-                optimizer_hooked_count = {i: 0 for i in range(len(optimizers))}
+                    i = trainer._fused_optimizer_map[tensor]
+                    trainer._fused_hooked_count[i] += 1
+                    if trainer._fused_hooked_count[i] == trainer._fused_num_params_per_group[i]:
+                        # All parameters in this group have gradients, step and free immediately
+                        trainer._fused_optimizers[i].step()
+                        trainer._fused_optimizers[i].zero_grad(set_to_none=True)
 
-            # Store reset function for use in training loop
-            self._reset_optimizer_hooked_count = reset_optimizer_hooked_count
-            self._blockwise_optimizers = optimizers
-            self._blockwise_lr_schedulers = lr_schedulers
+                param.register_post_accumulate_grad_hook(grad_hook)
 
-            # Register hooks on each parameter
-            for param, opt_idx in parameter_optimizer_map.items():
-                def create_grad_hook(p, idx):
-                    def grad_hook(grad_param):
-                        nonlocal optimizer_hooked_count
-                        # Clip gradients if needed
-                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                            # Clip this single parameter's gradient
-                            torch.nn.utils.clip_grad_norm_([p], args.max_grad_norm)
-
-                        optimizer_hooked_count[idx] += 1
-                        if optimizer_hooked_count[idx] == num_parameters_per_group[idx]:
-                            # All parameters in this group have gradients, step the optimizer
-                            optimizers[idx].step()
-                            optimizers[idx].zero_grad(set_to_none=True)
-                    return grad_hook
-
-                param.register_post_accumulate_grad_hook(create_grad_hook(param, opt_idx))
-
-            accelerator.print(f"Registered gradient hooks for {len(parameter_optimizer_map)} parameters across {len(optimizers)} optimizers")
+            accelerator.print(f"Registered gradient hooks for {len(self._fused_optimizer_map)} parameters across {len(optimizers)} optimizers")
 
         if args.full_fp16:
             # patch accelerator for fp16 training
@@ -2314,7 +2303,8 @@ class NetworkTrainer:
 
                 # Reset optimizer hooked count for blockwise fused optimizers
                 if blockwise_fused_optimizers:
-                    self._reset_optimizer_hooked_count()
+                    for i in range(len(self._fused_optimizers)):
+                        self._fused_hooked_count[i] = 0
 
                 latents = batch["latents"]
 
@@ -2365,7 +2355,7 @@ class NetworkTrainer:
                     if blockwise_fused_optimizers:
                         # optimizer.step() and zero_grad() are called in the gradient hooks
                         # Just step all lr_schedulers
-                        for sched in self._blockwise_lr_schedulers:
+                        for sched in self._fused_lr_schedulers:
                             sched.step()
                     else:
                         optimizer.step()
