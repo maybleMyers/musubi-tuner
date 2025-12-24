@@ -686,7 +686,10 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
 
                 def _safe_forward(self, x):
                     target_device = x.device
-                    weight = self.weight.to(device=target_device, dtype=torch.float32)
+                    # Convert fp8 to float32 first (on CPU if weight is on CPU), then move to target device
+                    # This avoids issues with fp8 device movement
+                    weight = self.weight.to(torch.float32)
+                    weight = weight.to(target_device)
                     scale = self.scale_weight.to(device=target_device, dtype=torch.float32)
                     if scale.ndim < 3:
                         w = weight * scale
@@ -696,8 +699,9 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
                         w = w * scale
                         w = w.view(self.weight.shape)
                     bias = self.bias.to(target_device) if self.bias is not None else None
-                    out = F.linear(x, w, bias)
-                    return out.to(x.dtype)
+                    # Compute in float32 to match dequantized weight, convert output back
+                    out = F.linear(x.float(), w, bias).type_as(x)
+                    return out
 
                 module.forward = _safe_forward.__get__(module, type(module))
         if getattr(args, "compile", False):

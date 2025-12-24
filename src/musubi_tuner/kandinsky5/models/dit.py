@@ -26,6 +26,7 @@ from .nn import (
 )
 from .utils import fractal_flatten, fractal_unflatten
 from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -190,12 +191,18 @@ class DiffusionTransformer3D(nn.Module):
             text_embed, time, pooled_text_embed, x, text_rope_pos
         )
 
+        # Capture device before loop - text_embed.device changes to CPU after each block due to activation offloading
+        offload_device = text_embed.device
+
         for block_idx, text_transformer_block in enumerate(self.text_transformer_blocks):
             if self.blocks_to_swap and self.offloader_text:
                 self.offloader_text.wait_for_block(block_idx)
             if self.training and self.gradient_checkpointing:
+                forward_fn = text_transformer_block
+                if self.activation_cpu_offloading:
+                    forward_fn = create_cpu_offloading_wrapper(forward_fn, offload_device)
                 text_embed = checkpoint(
-                    text_transformer_block,
+                    forward_fn,
                     text_embed,
                     time_embed,
                     text_rope,
@@ -215,8 +222,11 @@ class DiffusionTransformer3D(nn.Module):
             if self.blocks_to_swap and self.offloader_visual:
                 self.offloader_visual.wait_for_block(block_idx)
             if self.training and self.gradient_checkpointing:
+                forward_fn = visual_transformer_block
+                if self.activation_cpu_offloading:
+                    forward_fn = create_cpu_offloading_wrapper(forward_fn, offload_device)
                 visual_embed = checkpoint(
-                    visual_transformer_block,
+                    forward_fn,
                     visual_embed,
                     text_embed,
                     time_embed,
@@ -231,6 +241,11 @@ class DiffusionTransformer3D(nn.Module):
                 )
             if self.blocks_to_swap and self.offloader_visual:
                 self.offloader_visual.submit_move_blocks_forward(self.visual_transformer_blocks, block_idx)
+
+        # Move outputs back to GPU after activation CPU offloading for after_blocks computation
+        if self.training and self.gradient_checkpointing and self.activation_cpu_offloading:
+            text_embed = text_embed.to(offload_device)
+            visual_embed = visual_embed.to(offload_device)
 
         x = self.after_blocks(visual_embed, visual_shape, to_fractal, text_embed, time_embed)
         return x
@@ -306,6 +321,9 @@ class DiffusionTransformer3D(nn.Module):
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False):
         self.gradient_checkpointing = True
         self.activation_cpu_offloading = activation_cpu_offloading
+        logger.info(
+            f"Kandinsky5: Gradient checkpointing enabled. Activation CPU offloading: {activation_cpu_offloading}"
+        )
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False

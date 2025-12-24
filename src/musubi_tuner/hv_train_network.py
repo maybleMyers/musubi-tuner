@@ -1850,9 +1850,89 @@ class NetworkTrainer:
         accelerator.print("prepare optimizer, data loader etc.")
 
         trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
-        optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
-            args, trainable_params
-        )
+
+        # blockwise fused optimizers: group parameters by transformer block
+        blockwise_fused_optimizers = getattr(args, "blockwise_fused_optimizers", False)
+        optimizers = []
+        lr_schedulers = []
+
+        if blockwise_fused_optimizers:
+            # Group parameters by their parent transformer block
+            # LoRA parameter names follow pattern: lora_unet_<block_type>_<block_idx>_...
+            # e.g., lora_unet_visual_transformer_blocks_0_self_attention_to_query.lora_down.weight
+            param_groups_by_block = {}
+
+            for group in trainable_params:
+                for param in group["params"]:
+                    # Find the parameter name in the network
+                    param_name = None
+                    for name, p in network.named_parameters():
+                        if p is param:
+                            param_name = name
+                            break
+
+                    if param_name is None:
+                        # Fallback: put in "other" group
+                        block_key = ("other", -1)
+                    else:
+                        # Parse block type and index from parameter name
+                        # Pattern: lora_unet_<type>_transformer_blocks_<idx>_...
+                        block_key = ("other", -1)
+                        if "text_transformer_blocks" in param_name:
+                            # Extract block index
+                            parts = param_name.split(".")
+                            for i, part in enumerate(parts):
+                                if "text_transformer_blocks" in part:
+                                    # The part might be like "text_transformer_blocks_0_self_attention_to_query"
+                                    # or split differently depending on naming
+                                    sub_parts = part.split("_")
+                                    for j, sp in enumerate(sub_parts):
+                                        if sp == "blocks" and j + 1 < len(sub_parts):
+                                            try:
+                                                idx = int(sub_parts[j + 1])
+                                                block_key = ("text", idx)
+                                                break
+                                            except ValueError:
+                                                pass
+                                    break
+                        elif "visual_transformer_blocks" in param_name:
+                            parts = param_name.split(".")
+                            for i, part in enumerate(parts):
+                                if "visual_transformer_blocks" in part:
+                                    sub_parts = part.split("_")
+                                    for j, sp in enumerate(sub_parts):
+                                        if sp == "blocks" and j + 1 < len(sub_parts):
+                                            try:
+                                                idx = int(sub_parts[j + 1])
+                                                block_key = ("visual", idx)
+                                                break
+                                            except ValueError:
+                                                pass
+                                    break
+
+                    if block_key not in param_groups_by_block:
+                        param_groups_by_block[block_key] = []
+                    param_groups_by_block[block_key].append(param)
+
+            # Create optimizer for each block group
+            block_keys_sorted = sorted(param_groups_by_block.keys(), key=lambda x: (x[0], x[1]))
+            for block_key in block_keys_sorted:
+                params = param_groups_by_block[block_key]
+                block_trainable_params = [{"params": params, "lr": args.learning_rate}]
+                _, _, opt, _, _ = self.get_optimizer(args, block_trainable_params)
+                optimizers.append(opt)
+                num_params = sum(p.numel() for p in params)
+                accelerator.print(f"  block {block_key}: {len(params)} tensors, {num_params:,} parameters")
+
+            accelerator.print(f"Using {len(optimizers)} blockwise fused optimizers")
+            optimizer = optimizers[0]  # Keep reference for compatibility
+            optimizer_name, optimizer_args, _, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
+                args, trainable_params
+            )
+        else:
+            optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
+                args, trainable_params
+            )
 
         # prepare dataloader
 
@@ -1881,7 +1961,12 @@ class NetworkTrainer:
         train_dataset_group.set_max_train_steps(args.max_train_steps)
 
         # prepare lr_scheduler
-        lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
+        if blockwise_fused_optimizers:
+            # Create lr_scheduler for each optimizer
+            lr_schedulers = [self.get_lr_scheduler(args, opt, accelerator.num_processes) for opt in optimizers]
+            lr_scheduler = lr_schedulers[0]  # Keep reference for compatibility
+        else:
+            lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
 
         # prepare training model. accelerator does some magic here
 
@@ -1927,6 +2012,58 @@ class NetworkTrainer:
             transformer.eval()
 
         accelerator.unwrap_model(network).prepare_grad_etc(transformer)
+
+        # Setup blockwise fused optimizers: register gradient hooks
+        if blockwise_fused_optimizers:
+            # Prepare additional optimizers and lr_schedulers (first one already prepared above)
+            for i in range(1, len(optimizers)):
+                optimizers[i] = accelerator.prepare(optimizers[i])
+                lr_schedulers[i] = accelerator.prepare(lr_schedulers[i])
+
+            # Build parameter to optimizer index mapping
+            parameter_optimizer_map = {}
+            num_parameters_per_group = [0] * len(optimizers)
+
+            # Rebuild the mapping from parameters to optimizer indices
+            block_keys_sorted = sorted(param_groups_by_block.keys(), key=lambda x: (x[0], x[1]))
+            for opt_idx, block_key in enumerate(block_keys_sorted):
+                for param in param_groups_by_block[block_key]:
+                    if param.requires_grad:
+                        parameter_optimizer_map[param] = opt_idx
+                        num_parameters_per_group[opt_idx] += 1
+
+            # Counter for tracking when all params in a group have gradients
+            optimizer_hooked_count = {}
+
+            def reset_optimizer_hooked_count():
+                nonlocal optimizer_hooked_count
+                optimizer_hooked_count = {i: 0 for i in range(len(optimizers))}
+
+            # Store reset function for use in training loop
+            self._reset_optimizer_hooked_count = reset_optimizer_hooked_count
+            self._blockwise_optimizers = optimizers
+            self._blockwise_lr_schedulers = lr_schedulers
+
+            # Register hooks on each parameter
+            for param, opt_idx in parameter_optimizer_map.items():
+                def create_grad_hook(p, idx):
+                    def grad_hook(grad_param):
+                        nonlocal optimizer_hooked_count
+                        # Clip gradients if needed
+                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                            # Clip this single parameter's gradient
+                            torch.nn.utils.clip_grad_norm_([p], args.max_grad_norm)
+
+                        optimizer_hooked_count[idx] += 1
+                        if optimizer_hooked_count[idx] == num_parameters_per_group[idx]:
+                            # All parameters in this group have gradients, step the optimizer
+                            optimizers[idx].step()
+                            optimizers[idx].zero_grad(set_to_none=True)
+                    return grad_hook
+
+                param.register_post_accumulate_grad_hook(create_grad_hook(param, opt_idx))
+
+            accelerator.print(f"Registered gradient hooks for {len(parameter_optimizer_map)} parameters across {len(optimizers)} optimizers")
 
         if args.full_fp16:
             # patch accelerator for fp16 training
@@ -2175,6 +2312,10 @@ class NetworkTrainer:
             for step, batch in enumerate(train_dataloader):
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
+                # Reset optimizer hooked count for blockwise fused optimizers
+                if blockwise_fused_optimizers:
+                    self._reset_optimizer_hooked_count()
+
                 latents = batch["latents"]
 
                 with accelerator.accumulate(training_model):
@@ -2216,13 +2357,20 @@ class NetworkTrainer:
                                 if param.grad is not None:
                                     param.grad = accelerator.reduce(param.grad, reduction="mean")
 
-                        if args.max_grad_norm != 0.0:
+                        if not blockwise_fused_optimizers and args.max_grad_norm != 0.0:
+                            # Skip clipping here for blockwise fused - it's done in the hooks
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    if blockwise_fused_optimizers:
+                        # optimizer.step() and zero_grad() are called in the gradient hooks
+                        # Just step all lr_schedulers
+                        for sched in self._blockwise_lr_schedulers:
+                            sched.step()
+                    else:
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -2576,6 +2724,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         nargs="*",
         help='additional arguments for optimizer (like "weight_decay=0.01 betas=0.9,0.999 ...") / オプティマイザの追加引数（例： "weight_decay=0.01 betas=0.9,0.999 ..."）',
+    )
+    parser.add_argument(
+        "--blockwise_fused_optimizers",
+        action="store_true",
+        help="enable blockwise fused optimizers: step optimizer per-block during backward pass to reduce peak VRAM"
+        " / ブロック単位のfused optimizerを有効にする：backward中にブロックごとにoptimizer stepを行いピークVRAMを削減",
     )
     parser.add_argument("--learning_rate", type=float, default=2.0e-6, help="learning rate / 学習率")
     parser.add_argument(
